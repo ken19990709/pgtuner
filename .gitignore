@@ -1,0 +1,22 @@
+# Python artifacts
+__pycache__/
+.pytest_cache/
+*.pyc
+build/
+dist/
+
+# Dependency-isolated venv (created by scripts/setup.sh, never committed)
+.venv/
+
+# pgtuner runtime state (experiment ledger / plan archives / instance registry —
+# local and persistent, never committed)
+.pgtuner/
+pgtuner.egg-info/
+
+# autoresearch session state
+.auto/
+autoresearch-dashboard.html
+
+# Editor/agent local config (kept out of the published repo)
+.zcode/
+.claude/

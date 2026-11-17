@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pgtuner"
+version = "0.11.0"
+description = "An agent-friendly PostgreSQL experiment workbench: instance registry, template clone pool, fast/slow benchmark channels, a plan workbench, and an evidence ledger."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+keywords = ["postgresql", "performance", "benchmark", "ai-agents", "tuning", "experiment", "ledger"]
+authors = [{ name = "kenxx" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "click>=8.1",
+    "rich>=13.0",
+    # psycopg2-binary: only needed when connecting to PostgreSQL (lazy import;
+    # purely local subcommands work without it)
+]
+
+[project.urls]
+Homepage = "https://github.com/kenxx/pgtuner"
+Repository = "https://github.com/kenxx/pgtuner"
+Issues = "https://github.com/kenxx/pgtuner/issues"
+Changelog = "https://github.com/kenxx/pgtuner/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+db = ["psycopg2-binary>=2.9"]
+# dev must yield a fully green offline `pytest tests/` run: psycopg2 is imported
+# at module top in five test files, so it belongs in dev as well.
+dev = ["pytest>=7", "psycopg2-binary>=2.9"]
+
+[project.scripts]
+pgtuner = "pgtuner.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["pgtuner*"]
+
+[tool.setuptools.package-data]
+"pgtuner.assets" = ["*.md", "*.sql"]
+"pgtuner.data" = ["*.json"]

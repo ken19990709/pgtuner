@@ -1,0 +1,15 @@
+# sdist completeness: tests must run from an unpacked sdist (conftest pins the
+# hermetic project root; fixtures/ are --with-db assets), and the READMEs'
+# cross-file links must resolve for offline readers. .zcode ships too: the
+# packaging drift guard compares the repo skill original against the packaged
+# copy, and config.json is a README-declared distribution artifact.
+include LICENSE
+include README.md README.zh-CN.md CHANGELOG.md CONTRIBUTING.md AGENTS.md CLAUDE.md
+include conftest.py
+recursive-include tests *.py *.sql
+recursive-include scripts *.sh *.py
+recursive-include pgtuner/assets *.md *.sql
+recursive-include pgtuner/data *.json
+recursive-include .zcode *.md
+include .zcode/config.json
+prune .zcode/plans

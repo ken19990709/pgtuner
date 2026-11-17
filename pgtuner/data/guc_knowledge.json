@@ -1,0 +1,1849 @@
+{
+  "generated_for": "硬件感知 GUC 自动调优工具",
+  "pg_versions": "13-18",
+  "formula_conventions": "gucs[].rules[].formula 为可直接 Python eval 的表达式：求值命名空间需提供 min/max/abs/int/round/ceil/floor/ln(=math.log 单参数)/log(=math.log, 支持第二参数底数)。硬件输入统一变量名：total_ram_gb（内存 GB，1GB=1048576kB）、cpu_cores、disk_type∈{hdd,ssd,nvme,cloud}（cloud 涵盖原调研的 san/网络云盘）、max_connections、db_size_gb。其余输入在各 rule 的 inputs 列出（如 workload_type∈{web,oltp,dw,mixed,desktop}、pg_version=13..18 整数、os_type∈{linux,windows,mac}、shared_buffers_kb、max_parallel_workers、wal_rate_mbps）。formula 返回 None 表示保持默认/不输出。内存公式输出单位一般为 kB（caveats 另有标注者除外）。hardware_probes[].rules[].formula 为 shell 命令字符串，非 Python 表达式。pain_level 为多主题调研合并后的最严等级，主题间分歧在 why_hard 与 version_notes 中如实标注。非硬件输入的获取路径（探测/观测/问询/派生）逐项见历史内部调研总报告第 5 节。",
+  "gucs": [
+    {
+      "name": "work_mem",
+      "description": "单个排序/哈希节点在溢出到临时文件前可用的内存上限；按「每个排序/哈希节点 × 每个并行 worker × 每个并发会话」独立计算，官方原文允许总内存 many times work_mem",
+      "default_value": "4MB",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "high",
+      "why_hard": "两头挨打：默认 4MB 让排序/哈希溢盘慢几十倍（HN 高赞：几个 join 就不够用）；调大后又因节点×worker×连接叠加而 OOM（Reddit 42MB→进程 1.5GB；AWS 复现 15 会话×1GB→OOM killer signal 9；pganalyze 实测两个 Sort 节点即 ~951MB）。hash 节点再乘 hash_mem_multiplier（PG15+ 2.0）；每个并行 worker 各拿完整一份（4 workers 最多 5 倍资源，官方原文）。三个主题（社区痛点/内存并行/工具盘点）均评为 high",
+      "rules": [
+        {
+          "inputs": ["total_ram_gb", "db_size_gb", "workload_type", "max_connections", "max_parallel_workers", "shared_buffers_kb"],
+          "formula": "max(4096, int((total_ram_gb * 1048576 - shared_buffers_kb) / ((max_connections + max_parallel_workers) * 3)) * {'web': 1, 'oltp': 1, 'dw': 0.5, 'mixed': 0.5, 'desktop': 0.1667}[workload_type] * (1.3 if db_size_gb < total_ram_gb else 0.9 if db_size_gb > total_ram_gb else 1.0) // 1024 * 1024)",
+          "origin": "PGTune（le0pard/pgtune src/features/configuration/configurationSelectors.js，源码核对；注释：每连接实际用 max_connections×2~3 份 work_mem，必须扣除 shared_buffers）",
+          "caveats": "输出单位 kB，向下取整到 MB、下限 4MB；db_size 档位为 less/greater_ram（PGTune 三档的中间档不修正）；Windows 且 PG≤17 上限 2097151kB；预算<4MB 时应建议降 max_connections/并行度或上 PgBouncer（PGTune 警告逻辑）"
+        },
+        {
+          "inputs": ["total_ram_gb", "max_connections"],
+          "formula": "int(total_ram_gb * 1048576 * 0.25 / max_connections)",
+          "origin": "EDB 官方教程 How to Tune PostgreSQL Memory（原文 Total RAM * 0.25 / max_connections）",
+          "caveats": "输出 kB；粗粒度入门式，无并行/安全系数维度"
+        },
+        {
+          "inputs": ["total_ram_gb", "max_connections", "workload_type"],
+          "formula": "int(total_ram_gb * 1048576 / max_connections) * {'web': 1, 'oltp': 1, 'dw': 0.5, 'mixed': 0.5, 'desktop': 0.1667}[workload_type]",
+          "origin": "Greg Smith pgtune（github.com/gregs1104/pgtune，2009–2013 源码）",
+          "caveats": "输出 kB；无安全系数、未扣 shared_buffers，现代场景偏激进，仅历史基线"
+        },
+        {
+          "inputs": ["total_ram_gb", "max_connections", "cpu_cores"],
+          "formula": "max(64, int(total_ram_gb * 409600 / max_connections / max(1, round(cpu_cores / 2))))",
+          "origin": "timescale/timescaledb-tune pkg/pgtune/memory.go（源码：GB×(400MB/conns)/round(cpus/2)，下限 64KB）",
+          "caveats": "输出 kB；隐含内存:CPU≈2:1 假设（8GB/4核/100连接→16MB）"
+        },
+        {
+          "inputs": ["total_ram_gb", "workload_type", "max_connections"],
+          "formula": "int(total_ram_gb * 1048576 * {'web': 1.0, 'oltp': 1.0, 'dw': 1.0, 'mixed': 0.5, 'desktop': 0.2}[workload_type] * {'web': 0.25, 'oltp': 0.35, 'dw': 0.5, 'mixed': 0.2, 'desktop': 0.1}[workload_type] / max_connections)",
+          "origin": "pgconfig.org（momoi-labs/pgconfig crates/pgconfig/src/rules.rs + API v4.0.0 实测互证）",
+          "caveats": "输出 kB；不含并行 worker 与 dbSize 维度，多连接+并行场景偏激进"
+        },
+        {
+          "inputs": ["work_mem_kb", "hash_nodes", "sort_nodes", "hash_mem_multiplier", "parallel_workers_per_gather"],
+          "formula": "(sort_nodes * work_mem_kb + hash_nodes * work_mem_kb * hash_mem_multiplier) * (1 + parallel_workers_per_gather)",
+          "origin": "AWS 内存管理博客（单查询内存公式）+ PostgreSQL 官方文档 many-times 警告 + Crunchy Data Parallel Queries in Postgres",
+          "caveats": "输出 kB：单查询最坏峰值内存，约束为 Σ活跃查询该值 + shared_buffers < total_ram 且建议 ≤ ~25% total_ram（Crunchy：(max_connections+max_parallel_workers)×work_mem ≤ 25% RAM）；节点数需从 EXPLAIN 统计。任何 work_mem 输出前必做该校验"
+        },
+        {
+          "inputs": ["freeable_mem_kb", "max_connections"],
+          "formula": "int(freeable_mem_kb * 4 / max_connections)",
+          "origin": "pganalyze The surprising logic of the Postgres work_mem setting（保守公式）",
+          "caveats": "输出 kB；pganalyze 同时建议实操法：log_temp_files=0 跑真实负载，无 temp file 日志即安全（Christophe Pettus：work_mem 是最依赖负载的参数，别只用公式）"
+        }
+      ],
+      "version_notes": "PG13–18 稳定 4MB；PG≤17 在 64 位 Windows（LLP64）上限 2097151kB（MAX_KILOBYTES），PG18 起放宽；PG15 起 hash 节点预算 ×hash_mem_multiplier(2.0)",
+      "sources": [
+        "https://www.postgresql.org/docs/current/runtime-config-resource.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:3646",
+        "https://github.com/le0pard/pgtune",
+        "https://www.enterprisedb.com/postgres-tutorials/how-tune-postgresql-memory",
+        "https://github.com/timescale/timescaledb-tune",
+        "https://github.com/momoi-labs/pgconfig",
+        "https://pganalyze.com/blog/5mins-postgres-work-mem-tuning",
+        "https://aws.amazon.com/blogs/database/understand-memory-management-in-amazon-rds-for-postgresql-to-avoid-out-of-memory/",
+        "https://news.ycombinator.com/item?id=29056405",
+        "https://www.reddit.com/r/PostgreSQL/comments/66igih/work_mem_out_of_memory_issue_help/",
+        "https://www.crunchydata.com/blog/parallel-queries-in-postgres"
+      ]
+    },
+    {
+      "name": "shared_buffers",
+      "description": "PostgreSQL 共享缓冲池（自身页面缓存）大小；与 OS page cache 双重缓冲",
+      "default_value": "128MB（initdb 时若内核 shm 设置不允许可能更低）",
+      "context": "postmaster",
+      "restart_required": true,
+      "pain_level": "high",
+      "why_hard": "默认 128MB 对真实服务器太小（Percona：bare uses memory），但官方『25% 起步、>40% 通常无益』原文自 PG8.3（2008，当时 1GB 内存算大机器）沿用至今，是保守折中而非最优点；Command Prompt 128GB 分析负载实测：25% 恰落在最差区间（30–50%），最优在极低或 ~90% 两端；云厂商各自为政（RDS 25% vs Aurora ≈68% vs AlloyDB ≈80% 二手）；改动需重启、试错成本高",
+      "rules": [
+        {
+          "inputs": ["total_ram_gb", "workload_type"],
+          "formula": "int(total_ram_gb * 1048576 / (16 if workload_type == 'desktop' else 4))",
+          "origin": "PG 官方文档（25%/40% 原典）+ PGTune + pgconfig.org + AWS RDS + Azure 四方一致的 25%",
+          "caveats": "输出 kB；官方原文前提是『专用数据库服务器且 RAM≥1GB』；desktop 场景 /16；大内存+分析负载应结合 db_size/workload 修正（Command Prompt：25% 可能落在最差区间，最优在两端）；>40% RAM 通常无益"
+        },
+        {
+          "inputs": ["total_ram_gb", "buffer_cache_hit_ratio"],
+          "formula": "int(total_ram_gb * 1048576 * 0.35)",
+          "origin": "AWS Database Blog（pg_buffercache 实测法：30–35% ideal；公式取区间上沿）",
+          "caveats": "输出 kB；AWS 给出 30–35% 区间；若 buffer cache 命中率 <0.9 则上调；基于 pg_buffercache 观察而非纯公式"
+        },
+        {
+          "inputs": ["total_ram_gb"],
+          "formula": "int(total_ram_gb * 1073741824 / 32768)",
+          "origin": "AWS RDS 默认参数组公式 {DBInstanceClassMemory/32768}（8kB 块；官方文档写 bytes 系笔误，32768=4×8192 即 RAM/4）",
+          "caveats": "输出 8kB 块数；仅适用本地盘/EBS 架构（RDS 依赖 OS page cache）；默认参数组不可改、静态参数需重启"
+        },
+        {
+          "inputs": ["total_ram_gb"],
+          "formula": "int(total_ram_gb * 1073741824 / 12038) - 50003",
+          "origin": "AWS Aurora 默认参数组 SUM(DBInstanceClassMemory/12038, -50003)（官方参数参考页，tabs 仅核对到 Aurora PG12/13/14）",
+          "caveats": "输出 8kB 页数；≈68%RAM − 390MB（AWS 博客口径 roughly 75%，不同文档页写法略异——如实并列）；仅适用 Aurora 共享存储架构（计算节点无 OS page cache、存储卸载）；更高版本是否沿用未核对，以 aws rds describe-db-parameters 实测为准"
+        },
+        {
+          "inputs": ["total_ram_gb"],
+          "formula": "int(total_ram_gb * (32768 if total_ram_gb > 2 else 16384))",
+          "origin": "Azure Database for PostgreSQL Flexible Server（parameters-resource-usage-memory 页官方公式）",
+          "caveats": "输出 8kB 页数；>2GiB 为 25% RAM，≤2GiB 为 12.5%；static 需重启；公式部署时固定，换 SKU 不自动重算（Azure 明示需手工同步）"
+        }
+      ],
+      "version_notes": "默认 128MB 长期稳定（≤PG8.3 为 32MB；25%/40% 建议原文自 PG8.3 逐字沿用）；大页家族演进：PG14 新增 huge_page_size、PG15 新增 shared_memory_size_in_huge_pages、PG17 新增 huge_pages_status",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+        "https://www.postgresql.org/docs/8.3/runtime-config-resource.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:2725",
+        "https://aws.amazon.com/blogs/database/determining-the-optimal-value-for-shared_buffers-using-the-pg_buffercache-extension-in-postgresql/",
+        "https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraPostgreSQL.Reference.ParameterGroups.html",
+        "https://learn.microsoft.com/en-us/azure/postgresql/parameters/parameters-resource-usage-memory",
+        "https://www.commandprompt.com/blog/shared-buffers-large-memory-postgresql-part-1",
+        "https://www.percona.com/blog/tuning-postgresql-database-parameters-to-optimize-performance"
+      ]
+    },
+    {
+      "name": "max_connections",
+      "description": "最大并发后端连接数；PostgreSQL 进程模型每连接一个进程，内存与调度开销按进程计",
+      "default_value": "100（typically；initdb 可能因内核设置调低）",
+      "context": "postmaster",
+      "restart_required": true,
+      "pain_level": "high",
+      "why_hard": "被嫌小后直接抬到数千：每连接一个后端进程→内存按进程翻倍、上下文切换风暴、CPU/IO 饱和，Cybertec：The whole system can melt down；高连接数迫使 work_mem 压低→查询变慢；空闲后端也各占 10–40MB RES（AWS 实测）；正确解是 PgBouncer 事务级池化而非调 GUC；standby 必须 ≥ primary 否则拒绝查询",
+      "rules": [
+        {
+          "inputs": ["total_ram_gb", "workload_type", "shared_buffers_kb", "max_parallel_workers"],
+          "formula": "max(100, min({'web': 200, 'oltp': 300, 'dw': 100, 'mixed': 100, 'desktop': 100}[workload_type], int((total_ram_gb * 1048576 - shared_buffers_kb) / 12288) - max_parallel_workers))",
+          "origin": "PGTune selectMaxConnections（源码核对；内存约束优先于类型默认值，MIN_WORK_MEM=4MB×3 安全系数）",
+          "caveats": "profile_cap 为硬编码经验值；不低于 PG 默认 100；超额需求一律引到 PgBouncer"
+        },
+        {
+          "inputs": ["cpu_cores", "effective_spindle_count"],
+          "formula": "cpu_cores * 2 + effective_spindle_count",
+          "origin": "PostgreSQL wiki NumberOfDatabaseConnections（has held up pretty well across a lot of benchmarks for years；core_count 不含 HT 线程；数据全缓存时 spindle 项=0）",
+          "caveats": "这是『活跃连接』上界；max_connections 应略高于此并配 PgBouncer 事务级池化"
+        },
+        {
+          "inputs": ["total_ram_gb"],
+          "formula": "min(5000, int(total_ram_gb * 1073741824 / 9531392))",
+          "origin": "AWS Aurora 默认参数组 LEAST(DBInstanceClassMemory/9531392, 5000)",
+          "caveats": "隐含每连接 9.09MB 内存预算；上限 5000"
+        },
+        {
+          "inputs": ["total_ram_gb"],
+          "formula": "min(5000, int(total_ram_gb * 1024 * 0.1049164697034809)) if total_ram_gb > 2 else int(total_ram_gb * 25)",
+          "origin": "Azure Flexible Server（parameters-connections-authentication-connection-settings 页官方原文 + 同页换算表，本次修订抓取核对）",
+          "caveats": "Azure 原页公式字面为 MIN(memoryGib×0.1049164697034809, 5000)，但同页换算表（2→50、4→429、16→1718、32→3437、48GiB+→5000）只有在系数按 MiB 生效（每 GiB ×1024×0.1049…≈107.43 连接、每连接≈9.5MiB）时才自洽——字面按 GiB 代入 16GiB 仅得 1，本公式按换算表实现（×1024）；≤2GiB 分支 memoryGib×25 即每 GiB 25 连接；允许范围 25–5000；static 需重启"
+        },
+        {
+          "inputs": ["total_ram_gb"],
+          "formula": "25 if total_ram_gb <= 2 else 50 if total_ram_gb <= 4 else 75 if total_ram_gb <= 6 else 100",
+          "origin": "timescaledb-tune pkg/pgtune/misc.go（maxConns 未提供时的内存阶梯，下限 25）",
+          "caveats": "Patroni <25 会强制回 100（源码注释）"
+        },
+        {
+          "inputs": ["cpu_cores"],
+          "formula": "max(400, cpu_cores * 2)",
+          "origin": "GitLab 运维文档 docs.gitlab.com/administration/postgresql/tune/（口径：vCPU 的 2–10 倍，生产最低 400；公式取下限）",
+          "caveats": "GitLab 同时点名 work_mem≥8MB、shared_buffers≥2GB"
+        },
+        {
+          "inputs": ["max_connections", "work_mem_mb", "mem_per_conn_mb", "avg_ops_per_connection", "total_ram_gb", "shared_buffers_mb"],
+          "formula": "max_connections * (mem_per_conn_mb + avg_ops_per_connection * work_mem_mb) <= total_ram_gb * 1024 - shared_buffers_mb",
+          "origin": "EDB/通用经验（wal-bgwriter.md:288 原式：每连接 5–10MB 基础内存 + work_mem×平均每连接排序/哈希节点数——倍数为符号量而非常数）",
+          "caveats": "内存防线校验（返回布尔）；avg_ops_per_connection=平均每连接排序/哈希节点数，负载相关、语料未给分负载缺省值——由 EXPLAIN/问询获得，缺省可取 PGTune 预算式的 3× 安全系数（见 work_mem 规则 1）；mem_per_conn_mb 取 5–10MB 经验区间；Cybertec 的 connection-limit 公式分母未能原文学证，不收录（t4 明确警告勿硬编码）"
+        }
+      ],
+      "version_notes": "长期稳定 100；PG 按 max_connections 预分配共享内存；PG16 起另有 reserved_connections（按角色预留）；配套 superuser_reserved_connections 默认 3；standby 的 max_connections 必须 ≥ primary",
+      "sources": [
+        "https://www.postgresql.org/docs/current/runtime-config-connection.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:1986",
+        "https://github.com/le0pard/pgtune",
+        "https://wiki.postgresql.org/wiki/Number_Of_Database_Connections",
+        "https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraPostgreSQL.Reference.ParameterGroups.html",
+        "https://learn.microsoft.com/en-us/azure/postgresql/parameters/parameters-connections-authentication-connection-settings",
+        "https://www.cybertec-postgresql.com/en/tuning-max_connections-in-postgresql/",
+        "https://docs.gitlab.com/administration/postgresql/tune/"
+      ]
+    },
+    {
+      "name": "random_page_cost",
+      "description": "规划器对非顺序获取一页的代价估计；seq_page_cost=1.0 为全模型刻度锚点，真正的调节量是二者比值；误差随 nestloop 内表循环次数线性放大（costsize.c 机理）",
+      "default_value": "4.0（PG13–18 恒定；seq_page_cost=1.0）",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "high",
+      "why_hard": "同一 GUC 两个方向都有实证——方向 A：4.0 是机械盘+90% 缓存假设的校准值，Aurora 上 4.0→1.1 提速 ~100×（shayon.dev）；方向 B：NVMe 上 1.1 反而变慢（SO 73196927）、Vondra 2025-10 实测单线程索引随机读仍慢 20–60×（提议默认 ~20）、DW 降到 1.1 会选出灾难性索引扫描（PGTune 源码注释）；PGTune 与 pgconfig 在 DW 取值公开分歧（4.0 vs 1.8）；2025-10 pgsql-hackers 仍在争论；1.1 源头是 pgtune issue #10（2017），Franck Pachot 称其为 magic value",
+      "rules": [
+        {
+          "inputs": ["db_size_gb", "total_ram_gb", "disk_type", "workload_type"],
+          "formula": "1.1 if db_size_gb < total_ram_gb else (4.0 if disk_type == 'hdd' else (4.0 if workload_type == 'dw' else 1.1))",
+          "origin": "PGTune selectRandomPageCost（源码逐行核对；决策序：先看库是否全内存→再看盘型→最后负载）",
+          "caveats": "SSD=1.1 有争议（Vondra 2025 实测反向、SO 反例），工具宜输出 conservative/balanced 双档并说明条件；DW 保持 4.0 防灾难性索引扫描；NVMe 的 1.0 为社区变体、无权威出处，可作可选档"
+        },
+        {
+          "inputs": ["disk_type", "workload_type"],
+          "formula": "4.0 if disk_type == 'hdd' else (1.8 if workload_type == 'dw' else 1.1)",
+          "origin": "pgconfig.org rules.rs（DW 分歧值 1.8）",
+          "caveats": "与 PGTune 的 DW=4.0 公开分歧——建议保守取 PGTune 的 4.0"
+        },
+        {
+          "inputs": ["db_size_gb", "total_ram_gb"],
+          "formula": "1.0 if db_size_gb < total_ram_gb else None",
+          "origin": "PostgreSQL 官方文档 Tip（数据库全缓存于 RAM 时 random=seq=1.0 并同时相对调低两 I/O 常数）",
+          "caveats": "仅当数据集确定常驻内存；与 Leis 的 CPU 参数×50 方案等价方向（见 cpu_tuple_cost）"
+        },
+        {
+          "inputs": ["risk_appetite"],
+          "formula": "{'conservative': 4.0, 'balanced': 1.1}[risk_appetite]",
+          "origin": "代价模型调研的工具建议（双方实证并存→双档输出）",
+          "caveats": "risk_appetite∈{conservative, balanced}；输出时应附适用条件说明"
+        },
+        {
+          "inputs": ["disk_type"],
+          "formula": "4.0 if disk_type == 'cloud' else 1.1",
+          "origin": "AWS Heroes 博客 + PG18 文档新措辞（网络附加存储延迟降低随机读相对开销；建议保持默认以获计划稳定性）",
+          "caveats": "云盘宁可 1.1 不降 1.0；pganalyze 认为云上大多可安全低于 4.0——材料分歧，默认取保守、允许用户覆盖"
+        }
+      ],
+      "version_notes": "PG13–18 数值恒 4.0（cost.h:25）；旧文档『随机访问比顺序慢 40 倍且预期 90% 命中缓存』措辞被 2025-10-30 commit 3896e861b3 重写为网络存储延迟措辞且 Backpatch-through: 13（在线 PG13–18 文档页均已是新措辞）；2025-10 pgsql-hackers 默认值争论未决；可按 tablespace 覆盖（get_tablespace_page_costs）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/include/optimizer/cost.h:25",
+        "https://github.com/le0pard/pgtune/issues/10",
+        "https://www.postgresql.org/message-id/80d8b470-50fe-40df-b692-3292dd015595@vondra.me",
+        "https://www.shayon.dev/post/2024/55/100x-faster-query-in-aurora-postgres-with-a-lower-random_page_cost",
+        "https://stackoverflow.com/questions/73196927/postgresql-random_page_cost-1-1-and-nvme-disk-slower-query",
+        "https://dev.to/aws-heroes/postgresql-with-modern-storage-what-about-a-lower-randompagecost-5b7f",
+        "https://pganalyze.com/blog/5mins-postgres-tuning-random_page_cost",
+        "https://github.com/momoi-labs/pgconfig"
+      ]
+    },
+    {
+      "name": "autovacuum_vacuum_scale_factor",
+      "description": "触发 vacuum 的死元组比例阈值；触发条件 = autovacuum_vacuum_threshold(默认50) + scale_factor × 表行数（PG18 起可再与 autovacuum_vacuum_max_threshold 取 Min）；可按表 storage parameter 覆盖",
+      "default_value": "0.2",
+      "context": "sighup",
+      "restart_required": false,
+      "pain_level": "high",
+      "why_hard": "0.2 对大表=几乎永远轮不到（10 亿行表要 2 亿行变更才触发），bloat 与 xid 回卷风险累积（SO: Why does autovacuum not vacuum my table），是 DBA 投诉第一来源；但全局调小会让小表被频繁 vacuum（写放大）——按表覆盖才是正解",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "0.1",
+          "origin": "Azure Autovacuum Tuning（Allowed range: 0.05 - 0.1；公式取区间上沿）",
+          "caveats": "全局建议区间 0.05–0.1；全局调小会让小表被频繁 vacuum，优先按表覆盖"
+        },
+        {
+          "inputs": ["target_dead_tuples", "biggest_table_live_tuples"],
+          "formula": "min(0.2, max(0.005, target_dead_tuples / biggest_table_live_tuples))",
+          "origin": "Percona 博客（大表 0.01–0.02）+ 官方触发公式 + Citus 13 tips（clamp 形式）",
+          "caveats": "按表精确式：ALTER TABLE big_table SET (autovacuum_vacuum_scale_factor=0.01–0.02, autovacuum_vacuum_threshold=1000)；target_dead_tuples 取可容忍死元组数（如 10 万–100 万）"
+        },
+        {
+          "inputs": ["vacuum_max_threshold", "autovacuum_vacuum_threshold", "scale_factor", "n_live_tup"],
+          "formula": "min(vacuum_max_threshold, autovacuum_vacuum_threshold + scale_factor * n_live_tup)",
+          "origin": "PG18 触发公式（新增 autovacuum_vacuum_max_threshold 封顶大表阈值，源码 autovacuum.c:3262-3264 证实 Min 语义）",
+          "caveats": "PG18 起可用 max_threshold（默认 100000000，-1 禁用）免逐表设置"
+        }
+      ],
+      "version_notes": "PG13–18 稳定 0.2（threshold 默认 50）；PG13 新增 insert 系列（insert_threshold=1000 / insert_scale_factor=0.2）；PG18 新增 autovacuum_vacuum_max_threshold",
+      "sources": [
+        "https://www.postgresql.org/docs/19/runtime-config-vacuum.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:267",
+        "https://stackoverflow.com/questions/50872099/why-does-autovacuum-not-vacuum-my-table",
+        "https://learn.microsoft.com/azure/postgresql/flexible-server/how-to-autovacuum-tuning",
+        "https://www.citusdata.com/blog/2022/07/28/debugging-postgres-autovacuum-problems-13-tips",
+        "https://www.percona.com/blog"
+      ]
+    },
+    {
+      "name": "autovacuum_vacuum_cost_limit",
+      "description": "autovacuum 的 I/O 成本预算（每个唤醒周期可消费的 cost 单位）；-1 跟随 vacuum_cost_limit=200；预算被所有活跃 worker 按比例分摊（官方文档）",
+      "default_value": "-1（跟随 vacuum_cost_limit=200）",
+      "context": "sighup",
+      "restart_required": false,
+      "pain_level": "high",
+      "why_hard": "默认预算 200 严重偏低（SSD 时代），但它是全局共享预算：加 worker 不加 limit=每个 worker 更慢（官方+Azure+Citus 三源一致）；社区推荐 2000–8000 属经验值非官方；个别博客写默认 2000 是错误（官方默认 200，源码已核）",
+      "rules": [
+        {
+          "inputs": ["autovacuum_max_workers"],
+          "formula": "round(200 * autovacuum_max_workers / 3)",
+          "origin": "PGTune selectAutovacuumVacuumCostLimit（源码逐字：随 worker 数放大保持每 worker 默认速度；仅 workers>3 时输出）",
+          "caveats": "cost limit 由所有活跃 worker 共享分摊（官方机制）；与 autovacuum_max_workers 必须成对调"
+        },
+        {
+          "inputs": ["autovacuum_max_workers"],
+          "formula": "max(2000, round(2000 * autovacuum_max_workers / 3))",
+          "origin": "AWS RDS 生产常用 + 社区共识（2000–8000，随 worker 数成比例；非官方文档值）",
+          "caveats": "AWS 常用 2000–8000（如 4000）；运行中的 worker 不吃 reload 新值（需 kill worker 或重启，Azure 提醒）；设置了 per-table cost 参数的 worker 不参与全局均衡"
+        },
+        {
+          "inputs": [],
+          "formula": "10000",
+          "origin": "Citus 13 tips（vacuum 跟不上死元组产生速率时给高值）",
+          "caveats": "同时建议观察 pg_stat_activity 中 autovacuum 会话进度"
+        },
+        {
+          "inputs": ["cost_delay_ms", "per_worker_cost_limit", "page_cost"],
+          "formula": "(1000 / cost_delay_ms) * (per_worker_cost_limit / page_cost)",
+          "origin": "源码机制推导（postgres/src/backend/commands/vacuum.c:2536-2615：msec=delay×balance/limit，睡后清零）+ Azure 吞吐算例",
+          "caveats": "返回 pages/s（×8KB 换算 MB/s），与盘的余量比较即可定 limit；成本常量 page_hit=1 / page_miss=2（PG13 为 10，PG14 起 2）/ page_dirty=20；推导关系未逐项验证"
+        }
+      ],
+      "version_notes": "长期稳定 -1→200（个别博客『默认 2000』为讹传）；vacuum_cost_page_miss PG13 10→PG14 2（PG14 release notes）",
+      "sources": [
+        "https://www.postgresql.org/docs/19/runtime-config-vacuum.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:224",
+        "https://github.com/le0pard/pgtune",
+        "https://www.citusdata.com/blog/2022/07/28/debugging-postgres-autovacuum-problems-13-tips",
+        "https://learn.microsoft.com/azure/postgresql/flexible-server/how-to-autovacuum-tuning",
+        "https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Appendix.PostgreSQL.CommonDBATasks.Autovacuum_Monitoring.Resolving_Performance.html"
+      ]
+    },
+    {
+      "name": "max_wal_size",
+      "description": "自动检查点之间允许 WAL 增长的上限（软限制）",
+      "default_value": "1GB",
+      "context": "sighup",
+      "restart_required": false,
+      "pain_level": "high",
+      "why_hard": "默认 1GB 写密集负载触发频繁 forced checkpoint，且 WAL 压力触发的 checkpoint 不受 completion_target 平滑（源码 IsCheckpointOnSchedule 落后即弃 sleep；pgEdge 实测 TPS 1000+→620（−40%）、12GB 初始化触发 18 次 IO storms）；同时是软限制——重负载/归档失败/复制槽滞留时 WAL 远超设定值，pg_wal 撑爆磁盘直到停机（Netdata/Fastware 事故帖）；调大延长崩溃恢复时间（官方明示）",
+      "rules": [
+        {
+          "inputs": ["wal_rate_mbps"],
+          "formula": "max(1024, int(wal_rate_mbps * 3600))",
+          "origin": "Crunchy Data（hold at least one hour's worth of WAL logs；wal_rate 可由 pg_stat_wal.wal_bytes 采样或 lsn 差分）",
+          "caveats": "输出 MB；软限制需保证 pg_wal 卷余量（建议 ≥2×max_wal_size）；增大→崩溃恢复时间变长，需结合 RTO 反向封顶 max_wal_size ≤ rto_seconds × wal_rate；验证：pg_stat_checkpointer（PG17+）或日志 requested/timed 比例，requested 应≈0"
+        },
+        {
+          "inputs": ["workload_type"],
+          "formula": "{'web': 4096, 'mixed': 4096, 'oltp': 8192, 'dw': 16384, 'desktop': 2048}[workload_type]",
+          "origin": "PGTune selectCheckpointSegments（源码核对，按 dbType 分档而非 RAM）",
+          "caveats": "输出 MB；min_wal_size 保持 1:4 比例"
+        },
+        {
+          "inputs": ["wal_rate_mbps", "workload_type"],
+          "formula": "min(20480, max(10240, int(wal_rate_mbps * 3600))) if workload_type == 'oltp' else max(1024, int(wal_rate_mbps * 3600))",
+          "origin": "pgEdge Checkpoints, Write Storms, and You（写密集 OLTP 10–20GB 起步）",
+          "caveats": "输出 MB；重度批加载 50GB+；与 PGTune OLTP 档 8GB 同量级"
+        },
+        {
+          "inputs": ["rto_seconds", "wal_rate_mbps"],
+          "formula": "int(rto_seconds * wal_rate_mbps)",
+          "origin": "恢复时间约束（恢复≈重放全部 WAL；官方『增大→恢复时间变长』的反向应用）",
+          "caveats": "输出 MB；作为 max_wal_size 的上限校验值"
+        }
+      ],
+      "version_notes": "PG13–18 稳定 1GB（boot_val=DEFAULT_MAX_WAL_SEGS 64×16MB，xlog_internal.h:91）；软限制原文已核对（heavy load / failing archive_command / high wal_keep_size 时可超出）",
+      "sources": [
+        "https://www.postgresql.org/docs/current/runtime-config-wal.html",
+        "https://www.postgresql.org/docs/current/wal-configuration.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:2202",
+        "https://www.crunchydata.com/blog/tuning-your-postgres-database-for-high-write-loads",
+        "https://www.pgedge.com/blog/checkpoints-write-storms-and-you",
+        "https://www.netdata.cloud/guides/postgres/postgres-wal-disk-full",
+        "https://www.postgresql.fastware.com/blog/how-to-solve-the-problem-if-pg-wal-is-full",
+        "postgres/src/backend/postmaster/checkpointer.c:782-933"
+      ]
+    },
+    {
+      "name": "default_statistics_target",
+      "description": "每列默认统计目标（直方图桶数；采样行数 300×target），行数估计质量的根因参数",
+      "default_value": "100",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "high",
+      "why_hard": "行数估计误差是代价模型失真第一根因（Leis PVLDB 2015：1/2/3 个 join 时 ≥10× 误差占 16%/32%/52%；成本常数校准的收益被基数误差盖过）；调大拖慢 ANALYZE 与规划；相关列误估需 CREATE STATISTICS 扩展统计而非加大 target；列级 target 才是正解；改后需重跑 ANALYZE。【分级分歧：社区痛点主题 medium、代价模型主题 high，合并取最严】",
+      "rules": [
+        {
+          "inputs": ["workload_type"],
+          "formula": "500 if workload_type == 'dw' else 100",
+          "origin": "PGTune（dw=500，源码核对）",
+          "caveats": "调大增加所有表的 ANALYZE/规划开销；官方更推荐对具体列 ALTER TABLE ... SET STATISTICS（上限 10000）；『DW 500–1000』属社区经验——社区痛点主题逐版核对 PG13/16/18/19 文档均无此句，与代价模型主题的出处表述矛盾（见总报告矛盾清单#2）"
+        },
+        {
+          "inputs": [],
+          "formula": "100",
+          "origin": "官方文档 + 代价模型主题诊断式规则（无统计问题证据保持默认）",
+          "caveats": "诊断到列级误差大时输出 ALTER TABLE ... SET STATISTICS 500 建议；OtterTune 自动搜索曾得 78（ML 参考；出处：OtterTune 论文 TPC-C 配置——本次修订在原会话提取物 /tmp/ottertune/paper.txt:1822 grep 到 default_statistics_target 78 实证；该数字未见于六份笔记正文，初版引用链断裂已补，见总报告 §3 #14）；OtterTune 论文将其列入 OLTP 观测影响力前 10 knob（『前 3』说法未能在论文原文核实，已按 t2 复核修正为 top-10）"
+        }
+      ],
+      "version_notes": "PG8.4 起 100（commit 65e3ea7641，10→100 且上限 1000→10000）；PG13–18 稳定；范围 1–10000（源码 MAX_STATISTICS_TARGET=vacuum.h:358；PG18 文档页未列范围）",
+      "sources": [
+        "https://www.postgresql.org/docs/current/runtime-config-query.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:750",
+        "http://www.vldb.org/pvldb/vol9/p204-leis.pdf",
+        "https://db.cs.cmu.edu/papers/2017/p1009-van-aken.pdf",
+        "https://github.com/le0pard/pgtune",
+        "https://stackoverflow.com/questions/62656313/postgresql-default-statistics-target-not-improving-row-estimation"
+      ]
+    },
+    {
+      "name": "enable_nestloop",
+      "description": "规划器方法开关：允许从计划空间排除 nested loop 路径",
+      "default_value": "on",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "high",
+      "why_hard": "行数低估使规划器把内表估成 1 行而强选 nested loop 造成灾难计划（Leis：this decision is extremely risky），用户被迫会话级关开关（2009 年 SO 帖至今）；官方定位 crude method / temporary solution；PG≤17 off=给路径加 1e10 假成本（可被大查询压过又污染 startup cost），PG18 改独立禁用计数，老经验失效",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "'on'",
+          "origin": "官方文档（temporary solution 定位）+ pgMustard PG18 语义变化文",
+          "caveats": "永不自动设 off；仅诊断模式输出 SET LOCAL enable_nestloop=off 会话级复现定位行数误估；正道路径：ANALYZE → default_statistics_target → ALTER TABLE SET STATISTICS → 扩展统计（官方建议次序）；PG18 前加 1e10 假成本可被大查询压过"
+        }
+      ],
+      "version_notes": "PG18 起 commit e222534679 改为独立 disabled_nodes 计数（先比禁用数再比成本），EXPLAIN 显示 Disabled: true（explain.c:1895）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:971",
+        "http://www.vldb.org/pvldb/vol9/p204-leis.pdf",
+        "https://stackoverflow.com/questions/594930/what-are-the-pitfalls-of-setting-enable_nestloop-to-off",
+        "https://www.pgmustard.com/blog/enable-parameters-work-differently-in-postgres-18"
+      ]
+    },
+    {
+      "name": "enable_seqscan",
+      "description": "规划器方法开关：允许排除顺序扫描路径",
+      "default_value": "on",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "high",
+      "why_hard": "最常被『关掉以强制走索引』的开关；官方明言 a temporary solution is to use one of these configuration parameters；PG≤17 的 1e10 假成本扭曲 startup cost（影响 LIMIT/游标插值）",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "'on'",
+          "origin": "官方文档（PG18 原文 temporary solution）",
+          "caveats": "永不自动 off；诊断用 SET LOCAL；全局关掉后部分查询全表变慢"
+        }
+      ],
+      "version_notes": "同 enable_nestloop 的 PG18 语义变化（commit e222534679）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:1029",
+        "https://www.pgmustard.com/blog/enable-parameters-work-differently-in-postgres-18"
+      ]
+    },
+    {
+      "name": "jit",
+      "description": "查询级 JIT 编译（LLVM）总开关；触发完全以规划器估算成本为依据（jit_above_cost），与实际执行时长无关",
+      "default_value": "on（PG12–18；PG19 起默认 off；PG11 正式版默认 off、beta 曾默认启用）",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "high",
+      "why_hard": "OLTP 成本一过 10 万即触发编译悬崖：Adam Johnson 案例 3217ms→10ms（JIT 编译占 99.7% 运行时间）；升级到 PG12+ 后『莫名变慢』高频帖（社区帖场景：从 PG10/11 升级到 12+；DBA SE / Reddit Cascade of doom）；PG19 翻转默认的 commit message：most large-scale deployments already disable JIT by default. Notably, this includes all hyperscalers。【分级分歧：社区痛点 medium（PG19 已官方纠错）、代价模型 high（OLTP 悬崖），合并取最严】",
+      "rules": [
+        {
+          "inputs": ["pg_version", "workload_type"],
+          "formula": "'off' if pg_version <= 18 and workload_type in ('oltp', 'web', 'mixed') else None",
+          "origin": "PGTune（PG12–18 且 web/oltp/mixed 输出 off）+ PG19 commit 7f8c88c2b8 + adamj.eu 案例",
+          "caveats": "None=保持默认不输出；dw 保持 on（长分析查询可从 JIT 获益），可用 jit_above_cost=1e6 减少误触发；PG19+ 默认已 off 无需动作"
+        }
+      ],
+      "version_notes": "PG11 引入、正式版默认 off（PG11 文档页原文 The default is off，本次修订抓取核对；机制：v11 分支 commit 8f32bacc00（2018-09-15，Tom Lane）把 jit_provider 默认从 llvmjit 改为 NULL，提交信息自述 JIT isn't quite mature enough to ship enabled-by-default——注意 guc.c 中 jit 的 boot 值仍为 true、REL_11_BETA1 beta 亦曾默认启用（guc.c:1739-1747），单看 guc.c 会误判；PG11 release notes：it is not currently enabled by default, even in builds that support it）→ PG12 起默认 on（commit 1f7fc7670c doc: JIT is enabled by default in PG 12）→ PG19 commit 7f8c88c2b8（2026-04-02，REL_19_BETA1）改回 off；PG20devel 源码 boot_val=false 印证。两份笔记正文（community-pain.md 事实表『PG11 引入并默认 on』、cost-model.md 速查表『on（PG≤18）』）与上述证据冲突，见总报告 §3 #12",
+      "sources": [
+        "https://www.postgresql.org/docs/11/runtime-config-query.html",
+        "https://www.postgresql.org/docs/release/12.0/",
+        "https://www.postgresql.org/docs/19/runtime-config-query.html",
+        "https://www.postgresql.org/message-id/E1w8GWU-002bSL-31%40gemulon.postgresql.org",
+        "postgres git 8f32bacc00 (In v11, disable JIT by default, 2018-09-15)",
+        "postgres git 1f7fc7670c (doc: JIT is enabled by default in PG 12, 2018-09-21)",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:1451",
+        "https://adamj.eu/tech/2023/11/09/django-disable-postgresql-jit/",
+        "https://dba.stackexchange.com/questions/264955/handling-performance-problems-with-jit-in-postgres-12",
+        "https://www.reddit.com/r/PostgreSQL/comments/qtsif5/cascade_of_doom_jit_and_how_a_postgres_update_led"
+      ]
+    },
+    {
+      "name": "max_parallel_workers_per_gather",
+      "description": "单个 Gather/Gather Merge 节点的并行 worker 上限（0=禁用并行查询）；每个 worker 各自获得完整一份资源配额（work_mem 等）",
+      "default_value": "2",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "high",
+      "why_hard": "OLTP（保持 2 或设 0）与分析（cpu/2~cpu）方向完全相反：低延迟点查无法从并行获益、并行偷走其他查询 CPU（Percona：Do not forget to disable parallel execution on servers with a heavy OLTP workload）；每 worker 各拿一份 work_mem（官方原文：4 workers 最多 5 倍 CPU/内存/IO）；worker 申请失败时以更少 worker 运行、可能低效",
+      "rules": [
+        {
+          "inputs": ["cpu_cores", "workload_type"],
+          "formula": "min(ceil(cpu_cores / 2), 4) if workload_type != 'dw' else min(ceil(cpu_cores / 2), max(4, cpu_cores // 4))",
+          "origin": "PGTune selectParallelSettings（源码核对；仅 cpu≥4 时输出并行段）",
+          "caveats": "dw 分支保证同时至少 4 条并行查询有 worker；cpu<4 时 PGTune 完全不输出并行参数"
+        },
+        {
+          "inputs": ["workload_type", "high_concurrency_oltp"],
+          "formula": "0 if workload_type == 'oltp' and high_concurrency_oltp else 2",
+          "origin": "Percona Parallel queries in PostgreSQL (2019)（heavy OLTP 建议关闭并行）",
+          "caveats": "cost 参数保持默认；worker 池给 autovacuum/维护留量"
+        },
+        {
+          "inputs": ["cpu_cores"],
+          "formula": "cpu_cores // 2",
+          "origin": "Crunchy Data Parallel Queries in Postgres (2024)（分析型可安全到核数一半甚至全部；32 核实测 10 workers 见顶 290s→88s）",
+          "caveats": "低并发分析/批处理适用；高并发 OLTP 不适用"
+        }
+      ],
+      "version_notes": "PG9.6 引入默认 0，PG10 起默认 2 至今不变（t5 修正了 PG9.6 即默认 2 的误记）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:2080",
+        "https://github.com/le0pard/pgtune",
+        "https://www.percona.com/blog/parallel-queries-in-postgresql/",
+        "https://www.crunchydata.com/blog/parallel-queries-in-postgres"
+      ]
+    },
+    {
+      "name": "synchronous_commit",
+      "description": "事务提交的 WAL 同步级别（off/local/remote_write/on/remote_apply）；可按会话/事务粒度设置（SET LOCAL）",
+      "default_value": "on",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "high",
+      "why_hard": "最有效的延迟优化之一，但要用『崩溃丢最近 ~3×wal_writer_delay（默认 ~600ms）已提交事务』来换，应用能否容忍丢失难以自动化判断；与 fsync=off 的区别常被混淆（off 不产生数据库不一致、只丢最近提交——官方 Asynchronous Commit 专页）",
+      "rules": [
+        {
+          "inputs": ["tolerable_loss_ms", "wal_writer_delay_ms"],
+          "formula": "'off' if tolerable_loss_ms >= 3 * wal_writer_delay_ms else 'on'",
+          "origin": "官方文档 wal-async-commit（maximum delay is three times wal_writer_delay）",
+          "caveats": "可仅对可容忍会话/事务局部启用（SET LOCAL）；Cybertec：若不能接受丢事务，短事务负载转而调 commit_delay 是唯一提速手段；off ≠ fsync=off（前者无一致性风险）"
+        }
+      ],
+      "version_notes": "长期稳定 on；wal_writer_delay 默认 200ms→最大丢失窗口 ~600ms",
+      "sources": [
+        "https://www.postgresql.org/docs/18/wal-async-commit.html",
+        "https://www.postgresql.org/docs/18/runtime-config-wal.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:2972",
+        "https://www.cybertec-postgresql.com/en/commit_delay-performance-postgresql-benchmark/"
+      ]
+    },
+    {
+      "name": "full_page_writes",
+      "description": "checkpoint 后首次修改的页整页写入 WAL（full-page image，防 torn page）",
+      "default_value": "on",
+      "context": "sighup",
+      "restart_required": false,
+      "pain_level": "high",
+      "why_hard": "关掉提速的诱惑最终以 torn page 静默/不可恢复损坏收场（EDB：to fix data corruption we assume there is no data corruption）；FPI 放大实测惊人：UUID 主键插入的 WAL ≈ BIGSERIAL 的 20 倍（40GB vs 2GB）；损坏只有崩溃后才发现",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "'on'",
+          "origin": "官方文档（might lead to either unrecoverable data corruption, or silent data corruption）+ EDB On the impact of full-page writes",
+          "caveats": "永不自动关；减小其开销的正道：拉长 checkpoint 间隔（checkpoint_timeout/max_wal_size）或开 wal_compression（官方文档明示 one way to reduce the cost）"
+        }
+      ],
+      "version_notes": "长期稳定 on",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-wal.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:1125",
+        "https://www.enterprisedb.com/blog/impact-full-page-writes",
+        "https://wiki.postgresql.org/wiki/Full_page_writes"
+      ]
+    },
+    {
+      "name": "fsync",
+      "description": "强制 WAL 落盘",
+      "default_value": "on",
+      "context": "sighup",
+      "restart_required": false,
+      "pain_level": "high",
+      "why_hard": "绝不能关（除一次性导入等场景）：断电/系统崩溃→不可恢复数据损坏（官方：High quality hardware alone is not a sufficient justification）；一旦关过，切回 on 需 initdb --sync-only / sync / 重挂载 / 重启等强制落盘仪式；commit_delay 在 fsync=off 时无效",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "'on'",
+          "origin": "官方文档 fsync 条目（can result in unrecoverable data corruption in the event of a power failure）",
+          "caveats": "永不自动关；文档给出从 off 切回 on 的强制落盘步骤"
+        }
+      ],
+      "version_notes": "长期稳定 on",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-wal.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:1118"
+      ]
+    },
+    {
+      "name": "effective_cache_size",
+      "description": "规划器对可用磁盘缓存（shared_buffers + OS page cache）的假设；只经 Mackert-Lohman 公式（b = ecs×T/total_pages，costsize.c:914）影响索引扫描代价估计，不分配任何内存",
+      "default_value": "4GB",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "最被误解的 GUC：大量用户以为它分配/预留内存（thebuild：It allocates nothing, reserves nothing）；默认 4GB 在大内存机上让规划器低估缓存命中、避开索引扫描；共享存储云库（Aurora）语义完全不同（与 shared_buffers 同公式）",
+      "rules": [
+        {
+          "inputs": ["total_ram_gb", "workload_type"],
+          "formula": "int(total_ram_gb * 1048576 * (0.25 if workload_type == 'desktop' else 0.75))",
+          "origin": "PGTune 与 pgconfig.org（两源一致 75%；desktop 25%）",
+          "caveats": "输出 kB；纯规划器提示不占内存，可热改；并发查询争抢缓存时应打折；文档口径 = shared_buffers + 预期 OS page cache"
+        },
+        {
+          "inputs": ["total_ram_gb"],
+          "formula": "int(total_ram_gb * 1048576 / 2)",
+          "origin": "EDB 教程（50% total RAM）",
+          "caveats": "输出 kB；EDB 口径偏保守"
+        },
+        {
+          "inputs": ["os_free_and_cached_gb"],
+          "formula": "int(os_free_and_cached_gb * 1048576)",
+          "origin": "Percona（用 OS top 的 free+cached RAM 实测校准，区间 50–75%）",
+          "caveats": "输出 kB；运行时校准规则，比静态百分比更贴近现实"
+        },
+        {
+          "inputs": ["total_ram_gb"],
+          "formula": "int(total_ram_gb * 1073741824 / 12038) - 50003",
+          "origin": "AWS Aurora 默认参数组（与 shared_buffers 同公式；存储卸载、无 OS page cache）",
+          "caveats": "输出 8kB 页数（换算 ≈68%RAM − 390MB；AWS 博客口径 roughly 75%——口径并列见总报告 §3 #6）；仅适用 Aurora 类共享存储架构，不可移植到本地盘"
+        },
+        {
+          "inputs": ["total_ram_gb", "shared_buffers_pages"],
+          "formula": "int(total_ram_gb * 131072 - shared_buffers_pages)",
+          "origin": "Azure parameters-query-tuning-planner-cost-constants（t5 核对：公式为 (memoryGib×131072) − shared_buffers，单位 8kB 页）",
+          "caveats": "输出 8kB 页数；shared_buffers_pages 为 Azure 公式算出的页数"
+        }
+      ],
+      "version_notes": "PG9.5 起默认 4GB（commit b910d7ea35）；2013 年『自动联动 shared_buffers×4』方案被官方回退（ee1e5662d8→a16d421ca4）——自动估算缓存的官方尝试曾失败；仅经 M-L 公式生效",
+      "sources": [
+        "https://www.postgresql.org/docs/current/runtime-config-query.html",
+        "postgres/src/include/optimizer/cost.h:34",
+        "postgres/src/backend/optimizer/path/costsize.c:914",
+        "https://thebuild.com/blog/all-your-gucs-in-a-row-effectivecachesize",
+        "https://github.com/le0pard/pgtune",
+        "https://www.percona.com/blog/removing-postgresql-bottlenecks-caused-by-high-traffic/",
+        "https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraPostgreSQL.Reference.ParameterGroups.html"
+      ]
+    },
+    {
+      "name": "maintenance_work_mem",
+      "description": "VACUUM/CREATE INDEX/ALTER TABLE ADD FOREIGN KEY 等维护操作的单命令内存上限；autovacuum 运行时最多被 autovacuum_max_workers 倍乘（官方原文）",
+      "default_value": "64MB",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "默认 64MB 使 vacuum/建索引需多趟全索引扫描（AWS RDS 文档）；PG16 及以前设 >1GB 对 VACUUM 完全无效（隐性 1GB 上限，白调）；Windows PG≤17 有 2GB 进程地址空间硬限；多个 autovacuum worker 各吃一份",
+      "rules": [
+        {
+          "inputs": ["total_ram_gb", "workload_type"],
+          "formula": "min(8388608, int(total_ram_gb * 1048576 * (0.125 if workload_type == 'dw' else 0.0625)))",
+          "origin": "PGTune selectMaintenanceWorkMem（RAM/16，dw /8，封顶 8GB；源码核对）",
+          "caveats": "输出 kB；Windows 且 PG≤17 上限 2097151kB（2GB−1MB，2GB 整会报错）；封顶演进：老 pgtune 2GB → 现行 PGTune 8GB"
+        },
+        {
+          "inputs": ["total_ram_gb"],
+          "formula": "min(2047 * 1024, int(total_ram_gb * 128 * 1024))",
+          "origin": "timescaledb-tune pkg/pgtune/memory.go（GB×128MB 封顶 2047MB）",
+          "caveats": "输出 kB；线性式而非百分比"
+        },
+        {
+          "inputs": ["total_ram_gb"],
+          "formula": "int(total_ram_gb * 1048576 * 0.05)",
+          "origin": "EDB 教程（Total RAM × 0.05）",
+          "caveats": "输出 kB"
+        },
+        {
+          "inputs": ["total_ram_gb"],
+          "formula": "int((82.5 * ln(total_ram_gb) + 40) * 1024)",
+          "origin": "Azure parameters-resource-usage-memory（官方原文 (long)(82.5 * ln(memoryGiB) + 40) * 1024，单位 kB）",
+          "caveats": "对数增长非常保守（256GiB 机器也只 ~497MB）；适合内存紧张或共享实例；换 SKU 不自动重算"
+        },
+        {
+          "inputs": ["total_ram_gb"],
+          "formula": "max(65536, int(total_ram_gb * 1073741824 / 63963136) * 1024)",
+          "origin": "AWS Aurora 默认参数组 GREATEST(DBInstanceClassMemory/63963136*1024, 65536)",
+          "caveats": "输出 kB；≈RAM/61、下限 64MB（16GiB→268MB）"
+        }
+      ],
+      "version_notes": "PG13–18 稳定 64MB（t5 推翻『16→64 发生在 PG14』的常见误记）；PG17 release notes：vacuum is no longer silently limited to one gigabyte of memory when maintenance_work_mem or autovacuum_work_mem are higher（TID store/radix tree 重构；『内存占用最多降 20×』数字源自提交讨论、未见于 release notes，未核实）",
+      "sources": [
+        "https://www.postgresql.org/docs/current/runtime-config-resource.html",
+        "https://www.postgresql.org/docs/release/17.0/",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:1968",
+        "https://github.com/le0pard/pgtune",
+        "https://learn.microsoft.com/en-us/azure/postgresql/parameters/parameters-resource-usage-memory",
+        "https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraPostgreSQL.Reference.ParameterGroups.html",
+        "https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Appendix.PostgreSQL.CommonDBATasks.Autovacuum_Monitoring.Resolving_Performance.html"
+      ]
+    },
+    {
+      "name": "checkpoint_timeout",
+      "description": "时间驱动的检查点间隔；与 max_wal_size 谁先到谁触发 checkpoint",
+      "default_value": "5min（范围 30s–1 天）",
+      "context": "sighup",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "默认 5min + max_wal_size 偏小导致 checkpoint 由 WAL 量驱动产生写风暴；调大摊薄 FPI 但崩溃恢复时间变长，且必须与 max_wal_size 配套（否则出现 requested checkpoint）",
+      "rules": [
+        {
+          "inputs": ["max_wal_size_mb", "wal_rate_mbps"],
+          "formula": "max(900, min(1800, int(max_wal_size_mb / max(wal_rate_mbps, 0.1))))",
+          "origin": "官方机制（先到先触发）+ Cybertec commit_delay 基准环境（15min/100GB）+ pgEdge（默认 5min 偏短）",
+          "caveats": "输出秒；max_wal_size_mb ÷ wal_rate_mbps（MB/s）已得秒、不再乘 60（初版误乘 60 已修正——语料原式为 timeout ≤ max_wal_size / wal_rate，wal-bgwriter.md R4）；间隔内 WAL 量应落在 min–max 区间；拉长间隔=摊薄 full-page writes（官方明示）但恢复时间变长；2026-11 验收修复：分母加 max(,0.1) 防除零，语义不变"
+        }
+      ],
+      "version_notes": "PG13–18 稳定 5min（guc_parameters.dat:429，boot_val 300s，min 30 max 86400）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-wal.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:429",
+        "https://www.cybertec-postgresql.com/en/commit_delay-performance-postgresql-benchmark/",
+        "https://www.pgedge.com/blog/checkpoints-write-storms-and-you"
+      ]
+    },
+    {
+      "name": "checkpoint_completion_target",
+      "description": "检查点写盘在整个间隔内的摊薄比例",
+      "default_value": "PG13：0.5；PG14–18：0.9",
+      "context": "sighup",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "被当成万能平滑器，但源码证实（checkpointer.c:782-933 IsCheckpointOnSchedule）：WAL 压力触发的 forced checkpoint 实际不受它平滑（落后即放弃 sleep 尽快追，take a nap, unless we are behind schedule）；PG13/PG14 默认值不同易被误导",
+      "rules": [
+        {
+          "inputs": ["pg_version"],
+          "formula": "0.9",
+          "origin": "PG14 release note（默认 0.5→0.9，Stephen Frost）+ 官方文档 Reducing this parameter is not recommended",
+          "caveats": "PG13 必须显式设 0.9（PG14+ 默认即 0.9）；PGTune 仅对 PG<14 显式输出，pgconfig 全版本显式输出；对 forced checkpoint 无效，别用它掩盖 max_wal_size 不足"
+        }
+      ],
+      "version_notes": "PG14 改默认（commit bbcc4eb2 与 PGTune 源码注释一致）；范围 0.0–1.0",
+      "sources": [
+        "https://www.postgresql.org/docs/13/runtime-config-wal.html",
+        "https://www.postgresql.org/docs/14/release-14.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:410",
+        "postgres/src/backend/postmaster/checkpointer.c:782-933",
+        "https://github.com/le0pard/pgtune"
+      ]
+    },
+    {
+      "name": "effective_io_concurrency",
+      "description": "预取/异步 I/O 并发度假设；PG13–17 仅影响 bitmap heap scan 预取（文档原文），PG18 起进入 AIO 体系并控制预取距离",
+      "default_value": "PG13–17：1（无 posix_fadvise 支持的平台为 0）；PG18 起：16",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "默认 1（PG18 前）远低于 SSD 实际并发能力，PG18 突改 16 又对 HDD 过头——默认值永远赶不上存储形态分化；PG<18 非 Linux 平台（无 posix_fadvise）非零值直接被拒绝；SSD=200/NVMe=1000 的具体数值只出自 PGTune，官方仅说 best value might be in the hundreds",
+      "rules": [
+        {
+          "inputs": ["disk_type", "pg_version", "os_type"],
+          "formula": "{'hdd': 2, 'ssd': 200, 'cloud': 300, 'nvme': 1000}[disk_type]",
+          "origin": "PGTune selectEffectiveIoConcurrency（源码核对；cloud 对应原 san）",
+          "caveats": "PG<18 且 os_type 非 linux（无 posix_fadvise，如 macOS/Windows）不输出（非零值被拒绝，PGTune 源码注释）；PG18 起默认已 16、所有平台统一；云盘（cloud）受基线 IOPS 限制不宜给 nvme 档"
+        },
+        {
+          "inputs": ["disk_type"],
+          "formula": "200 if disk_type == 'ssd' else None",
+          "origin": "AWS re:Post 高赞组合（random_page_cost=1.1 + effective_io_concurrency=200）",
+          "caveats": "与 random_page_cost=1.1 联动的社区经验"
+        },
+        {
+          "inputs": ["pg_version"],
+          "formula": "1 if pg_version <= 17 else 16",
+          "origin": "PG 官方默认值（兜底：探测失败/介质未知时保持默认，绝不因『可能是 SSD』激进）",
+          "caveats": "HDD 用户在 PG18 下建议调回 1–2 属社区经验（文档仅给机械盘按 RAID 盘数取值指引）"
+        }
+      ],
+      "version_notes": "PG18 commit ff79b5b2（2025-03-12，默认 1→16，t1/t6 本地 git 验证）与 commit 2a5e709e72（2025-03-30，平台统一、移除无 fadvise 平台的 0 分支，t2 核对）为同系列两条记录（笔记间日期/标题不同，如实并列）；release notes：This more accurately reflects modern hardware；PG13 改过非默认值的换算语义（跨版本迁移需按 round(sum(OLD/n)) 折算）；范围 1–1000、0 禁用",
+      "sources": [
+        "https://www.postgresql.org/docs/17/runtime-config-resource.html",
+        "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+        "https://www.postgresql.org/docs/18/release-18.html",
+        "postgres/src/include/storage/bufmgr.h:170",
+        "https://github.com/le0pard/pgtune",
+        "https://repost.aws/questions/QUUmEhwNNTRBeMdh3sYLrcSQ/how-to-setup-high-performance-postgresql-in-an-aws-local-zone"
+      ]
+    },
+    {
+      "name": "autovacuum_max_workers",
+      "description": "autovacuum 并发 worker 数上限",
+      "default_value": "3",
+      "context": "postmaster（PG13–17）；sighup（PG18 起，受 autovacuum_worker_slots 上限约束）",
+      "restart_required": true,
+      "restart_required_note": "PG13–17 为 postmaster 需重启；PG18 起为 sighup 可 reload（上限 autovacuum_worker_slots，默认 16）",
+      "pain_level": "medium",
+      "why_hard": "默认 3 对大库不够，但 cost_limit 是共享预算：加 worker 不加 limit=每个 worker 更慢（官方文档）；PG13–17 改它要重启；更多 worker 各吃更多 autovacuum_work_mem/maintenance_work_mem",
+      "rules": [
+        {
+          "inputs": ["cpu_cores"],
+          "formula": "5 if cpu_cores >= 32 else (4 if cpu_cores >= 16 else 3)",
+          "origin": "PGTune selectAutovacuumMaxWorkers（源码核对）",
+          "caveats": "必须与 autovacuum_vacuum_cost_limit 联动（见该条规则）；Azure：3→4/5 即可，Don't use a high number of autovacuum workers（内存与均衡变慢）；运行中的 worker 不吃 reload 新值"
+        },
+        {
+          "inputs": ["total_ram_gb"],
+          "formula": "max(3, total_ram_gb // 64)",
+          "origin": "AWS Aurora 默认参数组 GREATEST(RAM/64GB, 3)（PG14 默认组表，t6 核对）",
+          "caveats": "依据 Aurora PG14 tabs；更高版本未核对"
+        }
+      ],
+      "version_notes": "PG18 新增 autovacuum_worker_slots（Nathan Bossart，commit c758119e5b，默认 16、postmaster 级），autovacuum_max_workers 免重启（PG18 release notes：can be adjusted at runtime up to this maximum without a server restart）",
+      "sources": [
+        "https://www.postgresql.org/docs/17/runtime-config-autovacuum.html",
+        "https://www.postgresql.org/docs/18/release-18.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:180",
+        "https://github.com/le0pard/pgtune",
+        "https://learn.microsoft.com/azure/postgresql/flexible-server/how-to-autovacuum-tuning",
+        "https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraPostgreSQL.Reference.ParameterGroups.html"
+      ]
+    },
+    {
+      "name": "join_collapse_limit",
+      "description": "显式 JOIN 拉平重排的表数上限，超过则 JOIN 按书写顺序处理（设 1 保持书写顺序）",
+      "default_value": "8",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "第 9 个起 JOIN 不再重排：glutenfreesql 案例（从 SQL Server 迁移的 ERP 查询第 11 个 join 起按书写顺序执行、性能骤降，调大后解决）；调大→规划时间组合爆炸；≥geqo_threshold（默认 12）可能触发 GEQO 遗传算法反而次优（官方文档）",
+      "rules": [
+        {
+          "inputs": ["avg_join_count"],
+          "formula": "8 if avg_join_count <= 8 else min(16, max(12, avg_join_count))",
+          "origin": "官方文档（planning time/plan quality 权衡原文）+ glutenfreesql 案例",
+          "caveats": "规划时间过长时反向降到 4–6；只在有查询级证据（典型 join 数 9–16 且计划差）时偏离默认；≥geqo_threshold(12) 有 GEQO 风险线；OtterTune 附录 DBA 配置用过 20"
+        }
+      ],
+      "version_notes": "长期稳定 8；geqo_threshold 默认 12（guc_parameters.dat:1191）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:1536",
+        "https://glutenfreesql.wordpress.com/2024/12/31/using-join_collapse-limit-to-solve-postgresql-performance-problem",
+        "https://db.cs.cmu.edu/papers/2017/p1009-van-aken.pdf"
+      ]
+    },
+    {
+      "name": "from_collapse_limit",
+      "description": "子查询并入上层 FROM 的表数上限（与 join_collapse_limit 同族的规划时间/计划质量权衡）",
+      "default_value": "8",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "多子查询/视图嵌套场景易踩：超过则子查询不再拉平；调大同样遇规划时间组合爆炸与 GEQO 阈值暗坑",
+      "rules": [
+        {
+          "inputs": ["avg_join_count"],
+          "formula": "8 if avg_join_count <= 8 else min(16, max(12, avg_join_count))",
+          "origin": "官方文档（同 join_collapse_limit 权衡）+ OtterTune 附录 DBA 配置（from/join_collapse_limit=20）",
+          "caveats": "与 join_collapse_limit 保持同步调整；≥geqo_threshold(12) 风险线"
+        }
+      ],
+      "version_notes": "长期稳定 8",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:1108",
+        "https://db.cs.cmu.edu/papers/2017/p1009-van-aken.pdf"
+      ]
+    },
+    {
+      "name": "enable_hashagg",
+      "description": "哈希聚合路径开关",
+      "default_value": "on",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "PG12 及以前哈希聚合不磁盘化、完全不计溢出成本→大 GROUP BY 计划失真，是『关开关绕过误估』的典型诱因；PG13 引入磁盘化+溢出计价后抱怨大减，但大基数 GROUP BY 仍偶发翻车（spill 计价依赖 random_page_cost 准确性）",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "'on'",
+          "origin": "官方文档（enable_* 的 temporary solution 定位）",
+          "caveats": "永不自动 off；诊断用 SET LOCAL"
+        }
+      ],
+      "version_notes": "PG13 起 HashAgg 磁盘化 + 溢出计价（commits 1f39bce021 + a547e68675）。tag 归属：笔记正文（cost-model.md §1.4）称二者均在 REL_13_BETA1，与调研结构化结果（a547e68675 不在该 tag）相反；本次修订实测 git merge-base --is-ancestor：1f39bce021 在（退出码 0）、a547e68675 不在（退出码 1）但已入 REL_14_BETA1（退出码 0）——溢出计价调整为后补、经 backpatch 进 PG13 GA，结构化结果正确而笔记正文半误（见总报告 §3 #11）；spill 计价见 costsize.c:2937-2980（pages_written×random_page_cost + depth×tuples×2×cpu_tuple_cost）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/backend/optimizer/path/costsize.c:2940-2980",
+        "https://www.postgresql.org/docs/release/13/"
+      ]
+    },
+    {
+      "name": "jit_above_cost",
+      "description": "JIT 编译触发的估算成本阈值（配套 jit_inline_above_cost / jit_optimize_above_cost 默认各 500000；-1 禁用）",
+      "default_value": "100000",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "完全以规划器估算成本为依据、不看实际执行时长（官方 jit-decision 文档）——成本小幅波动即触发编译悬崖；多数建议直接 -1 或禁 jit",
+      "rules": [
+        {
+          "inputs": ["workload_type"],
+          "formula": "-1 if workload_type in ('oltp', 'web') else (1000000 if workload_type in ('mixed', 'dw') else 100000)",
+          "origin": "PG19 commit（hyperscalers 全关）+ 代价模型主题规则",
+          "caveats": "-1 与 jit=off 等效；dw 保持 on 但提高阈值至 ~1e6 减少误触发"
+        }
+      ],
+      "version_notes": "长期稳定 100000（guc_parameters.dat:1458，min -1）；PG15+ 另有 jit_inline_above_cost/jit_optimize_above_cost 默认 500000",
+      "sources": [
+        "https://www.postgresql.org/docs/current/jit-decision.html",
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:1458"
+      ]
+    },
+    {
+      "name": "temp_file_limit",
+      "description": "单后端进程临时文件（排序/哈希溢盘）用量上限，超限取消事务；显式临时表不计入限额",
+      "default_value": "-1（无限制）",
+      "context": "superuser",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "云厂商常设低默认值→ETL 大查询直接 ERROR: temporary file size exceeds temp_file_limit 被取消（Google Cloud SQL 错误手册专列）；显式临时表不计入限额、行为反直觉",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "-1",
+          "origin": "官方文档（A transaction attempting to exceed this limit will be canceled）+ Google Cloud SQL 错误手册",
+          "caveats": "自建保持 -1；如需设上限，按 pgdata 卷余量与并发溢盘查询数估算（调研未给出现成公式，如实注明）"
+        }
+      ],
+      "version_notes": "长期稳定 -1；superuser context（仅有 SET 权限者亦可）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:3073",
+        "https://docs.cloud.google.com/sql/docs/postgres/error-messages"
+      ]
+    },
+    {
+      "name": "huge_pages",
+      "description": "请求 Linux 显式大页（try/on/off）；PG 经 MAP_HUGETLB 使用显式大页，与 THP 无关",
+      "default_value": "try",
+      "context": "postmaster",
+      "restart_required": true,
+      "pain_level": "medium",
+      "why_hard": "on 但 OS 未预留足够大页→服务器拒绝启动（SO 帖）；try 失败静默回退 4kB 页（用户以为生效了，需查 HugePages_Rsvd 确认）；不用大页的代价：大 shared_buffers 下每连接页表膨胀、TLB miss 增多；THP 官方 currently discouraged 且常与显式大页混淆",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "'try'",
+          "origin": "官方文档 + PGTune（hugePageThreshold=2GB：shared_buffers ≥ 2GB 才建议启用大页并预留）",
+          "caveats": "永不输出 on（未预留会拒绝启动）；运维顺序 try→计算→预留（sysctl vm.nr_hugepages）→再 on；Linux 需 shared_memory_type=mmap（默认即是）；Windows 需 Lock pages in memory 权限"
+        },
+        {
+          "inputs": ["shared_memory_bytes", "huge_page_size_bytes"],
+          "formula": "ceil(shared_memory_bytes / huge_page_size_bytes)",
+          "origin": "源码 src/backend/storage/ipc/ipci.c:207-215 + 官方文档 §18.4.5（PG15+ 可直接 postgres -D $PGDATA -C shared_memory_size_in_huge_pages 读取）",
+          "caveats": "返回所需大页数；配置 sysctl vm.nr_hugepages 或 /sys/kernel/mm/hugepages/hugepages-*/nr_hugepages；碎片化时可能要重试或重启才分满；给其它程序留余量；vm.hugetlb_shm_group 与 ulimit -l 可能需配"
+        }
+      ],
+      "version_notes": "PG13–18 默认 try；PG14 新增 huge_page_size、PG15 新增 shared_memory_size_in_huge_pages、PG17 新增 huge_pages_status；RDS/Aurora 默认已启用大页（t3.medium 等小机型除外）；Percona 基准：库装得进 shared_buffers 时 1GB 大页 > 2MB > 4KB",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+        "https://www.postgresql.org/docs/18/kernel-resources.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:1266",
+        "postgres/src/backend/storage/ipc/ipci.c:207-215",
+        "https://github.com/le0pard/pgtune",
+        "https://www.percona.com/blog/benchmark-postgresql-with-linux-hugepages/",
+        "https://stackoverflow.com/questions/71699310/postgres-doesnt-connect-when-i-enable-huge-page",
+        "https://thebuild.com/blog/huge-pages-end-to-end"
+      ]
+    },
+    {
+      "name": "max_worker_processes",
+      "description": "全集群后台进程总池——并行 worker、逻辑复制 worker 与扩展后台 worker（pg_cron/TimescaleDB 等）共用",
+      "default_value": "8",
+      "context": "postmaster",
+      "restart_required": true,
+      "pain_level": "medium",
+      "why_hard": "standby 必须设不低于 primary，否则 standby 拒绝查询（官方）；逻辑复制/扩展从同一池抢——设小了并行查询隐性降级（少于预期的 worker 运行，may be inefficient）；改它要重启",
+      "rules": [
+        {
+          "inputs": ["cpu_cores"],
+          "formula": "max(min(cpu_cores, 1024), 8)",
+          "origin": "PGTune（源码：不为逻辑复制/扩展降池，Never lower than PostgreSQL default）",
+          "caveats": "standby 必须 ≥ primary"
+        },
+        {
+          "inputs": ["cpu_cores"],
+          "formula": "max(cpu_cores, 8)",
+          "origin": "pgconfig.org rules.rs",
+          "caveats": "Aurora 用 GREATEST($DBInstanceVCPU*2, 8) 即 max(2*cpu_cores, 8)"
+        },
+        {
+          "inputs": ["cpu_cores"],
+          "formula": "3 + 16 + cpu_cores",
+          "origin": "timescaledb-tune parallel.go（3 内置进程 + timescaledb.max_background_workers 默认 16 + cpu）",
+          "caveats": "Crunchy 经验法则：≥25% vCPU（max(8, cpu_cores//4)）"
+        }
+      ],
+      "version_notes": "长期稳定 8；逻辑复制 worker 取 worker 槽自 max_worker_processes（logical-replication.sgml）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:2212",
+        "https://github.com/le0pard/pgtune",
+        "https://github.com/timescale/timescaledb-tune",
+        "https://www.crunchydata.com/blog/parallel-queries-in-postgres"
+      ]
+    },
+    {
+      "name": "max_parallel_workers",
+      "description": "并行 worker 总数上限（池最终受 max_worker_processes 约束）",
+      "default_value": "8",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "设高于 max_worker_processes 的部分静默无效（官方原文 no effect）——两池关系少有人知；高事务系统应压低它给维护留 worker（Crunchy）",
+      "rules": [
+        {
+          "inputs": ["cpu_cores"],
+          "formula": "min(cpu_cores, 1024)",
+          "origin": "PGTune（源码核对；1024 与源码 MAX_PARALLEL_WORKER_LIMIT=bgworker_internals.h:24 一致）",
+          "caveats": "与 max_worker_processes 联动（后者取 max(此值, 8)）"
+        },
+        {
+          "inputs": ["cpu_cores"],
+          "formula": "max(cpu_cores, 8)",
+          "origin": "pgconfig.org rules.rs（Aurora 变体：GREATEST(vCPU/2, 8) 即 max(cpu_cores//2, 8)；timescaledb-tune：cpu_cores）",
+          "caveats": "高事务率系统反向压低以给维护留 worker（Crunchy）"
+        }
+      ],
+      "version_notes": "PG10 引入默认 8 至今不变（PG10 文档原文核实）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:2071",
+        "postgres/src/include/postmaster/bgworker_internals.h:24",
+        "https://github.com/le0pard/pgtune",
+        "https://github.com/momoi-labs/pgconfig"
+      ]
+    },
+    {
+      "name": "parallel_setup_cost",
+      "description": "并行 worker 启动成本闸门（与小查询不该并行的保护机制共同决定并行触发）",
+      "default_value": "1000.0",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "默认 1000 挡住小查询并行（OLTP 天然保护——此为合理阐释非文档原文）；分析场景想强制并行需大幅调低（Percona 演示 setup=1），调低又把不适合并行的短查询推向并行、worker 启动开销反噬 OLTP——双向抱怨",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "1000.0",
+          "origin": "官方默认（cost.h:30）",
+          "caveats": "默认不动；Percona 演示值 1 仅用于强制小分区表并行（非生产推荐，伤 OLTP）"
+        }
+      ],
+      "version_notes": "PG13–18 与源码默认一致（cost.h:30 DEFAULT_PARALLEL_SETUP_COST 1000.0）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/include/optimizer/cost.h:30",
+        "https://www.percona.com/blog/parallel-queries-in-postgresql/"
+      ]
+    },
+    {
+      "name": "parallel_tuple_cost",
+      "description": "每个元组从 worker 传回 leader 的成本估计（与 parallel_setup_cost 共同决定并行触发）",
+      "default_value": "0.1",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "调低可让小表查询走并行但伤 OLTP；保持默认则小查询永远串行——与 setup_cost 同为双向抱怨点",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "0.1",
+          "origin": "官方默认（cost.h:29）",
+          "caveats": "默认不动；Percona 演示值 0.01 仅用于强制并行演示（非生产推荐）"
+        }
+      ],
+      "version_notes": "PG13–18 与源码默认一致（cost.h:29 DEFAULT_PARALLEL_TUPLE_COST 0.1）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/include/optimizer/cost.h:29",
+        "https://www.percona.com/blog/parallel-queries-in-postgresql/"
+      ]
+    },
+    {
+      "name": "min_parallel_table_scan_size",
+      "description": "表侧并行扫描最小数据量阈值；自动并行度按 3 倍几何级数计算：workers = 1 + floor(log3(pages/threshold))，索引侧同式并取 Min，再受 per_gather 封顶（源码 allpaths.c:4973-5044）",
+      "default_value": "8MB",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "worker 数 not cost-based（可用 ALTER TABLE ... SET (parallel_workers=N) 覆盖）——改这两个阈值等于直接改并行触发门槛、绕过成本模型；Crunchy：generally only for testing，best to let the planner do everything",
+      "rules": [
+        {
+          "inputs": ["table_mb"],
+          "formula": "1 + int(log(table_mb / 8, 3))",
+          "origin": "PG 源码 compute_parallel_worker（src/backend/optimizer/path/allpaths.c:4973-5044）+ Percona 同款公式（8MB→1w、24MB→2w、72MB→3w）",
+          "caveats": "返回表侧 worker 数（table_mb 为表数据量 MB，阈值取默认 8MB）；与索引侧（512kB）计算结果取 Min，再封顶 per_gather；table_mb < 8 时为 0"
+        },
+        {
+          "inputs": [],
+          "formula": "8192",
+          "origin": "官方默认 + Crunchy（真实负载别动，交给规划器）",
+          "caveats": "输出 kB；调小→更多小表并行，OLTP 下加剧 worker 池争抢"
+        }
+      ],
+      "version_notes": "长期稳定 8MB（boot_val=(8*1024*1024)/BLCKSZ）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/backend/optimizer/path/allpaths.c:4973",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:2254",
+        "https://www.percona.com/blog/parallel-queries-in-postgresql/",
+        "https://www.crunchydata.com/blog/parallel-queries-in-postgres"
+      ]
+    },
+    {
+      "name": "wal_compression",
+      "description": "FPI（full-page image）压缩；PG13/14 为 boolean（on=pglz），PG15+ 为 enum off/on/pglz/lz4/zstd（lz4/zstd 需编译期 --with-lz4/--with-zstd）",
+      "default_value": "off",
+      "context": "superuser（PG15+：superusers and users with the appropriate SET privilege）",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "CPU 与 WAL 量的权衡；PG15 前后类型语义不同；Percona 实测开启后吞吐反升 10–15%（IO 等待减少），zstd 比 lz4 再省 30% WAL；standby 二进制必须带对应压缩库",
+      "rules": [
+        {
+          "inputs": ["pg_version", "cpu_saturated", "cpu_headroom_high", "wal_bottleneck"],
+          "formula": "'off' if cpu_saturated else ('zstd' if pg_version >= 15 and cpu_headroom_high and wal_bottleneck else ('lz4' if pg_version >= 15 else ('on' if wal_bottleneck else 'off')))",
+          "origin": "Percona 基准（lz4≈pglz 压缩率但 CPU 低得多；zstd 比 lz4 再省 30% WAL；吞吐 +10–15%）+ 官方文档",
+          "caveats": "仅压缩 FPI、不增加损坏风险但耗 CPU；连带收益：压缩后同期 WAL 变少→forced checkpoint 概率下降；standby 需同压缩库"
+        },
+        {
+          "inputs": ["pg_version"],
+          "formula": "'lz4' if pg_version >= 15 else 'on'",
+          "origin": "PGTune（PG15+ 推荐 lz4；PG19+ 输出 on）",
+          "caveats": "PG13–18 内 on 恒等于 pglz"
+        }
+      ],
+      "version_notes": "PG15 加 lz4/zstd（release notes：Allow WAL full page writes to use LZ4 and Zstandard compression）；on=pglz（PG15–18，文档 historical spelling）；PG20devel 起 on 改为 zstd→lz4→pglz 编译期择优（commit 931c9701f2；PGTune 注释写 PG19+ 与 git 时间线不符——t4 已指出，应为 PG20）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-wal.html",
+        "https://www.postgresql.org/docs/15/release-15.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:3469",
+        "https://www.percona.com/blog/wal-compression-in-postgresql-and-recent-improvements-in-version-15",
+        "https://github.com/le0pard/pgtune"
+      ]
+    },
+    {
+      "name": "autovacuum_naptime",
+      "description": "autovacuum launcher 轮询间隔；每 naptime/N 秒起一个 worker（N=数据库数，官方 routine-vacuuming 原文）",
+      "default_value": "1min",
+      "context": "sighup",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "多库集群下 N 大时调度节奏失控（Azure 举例：60 库 + 60s naptime → 每秒起一个 worker）；naptime 只影响 worker 启动节奏、不改变触发阈值",
+      "rules": [
+        {
+          "inputs": ["n_databases", "avg_db_vacuum_seconds", "autovacuum_max_workers"],
+          "formula": "max(60, n_databases * avg_db_vacuum_seconds // autovacuum_max_workers)",
+          "origin": "官方机制（每 naptime/N 秒起一个 worker）+ Azure（库多则加大 naptime 并同步调猛 cost_limit/workers）",
+          "caveats": "输出秒；由覆盖条件 workers×单库扫描时长 ≥ N×naptime 反解（调研笔记给出条件、除以 workers 为等价改写）；覆盖不了时加大 naptime 并同步调 cost_limit/workers"
+        }
+      ],
+      "version_notes": "长期稳定 1min（范围 1s 起）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-autovacuum.html",
+        "https://www.postgresql.org/docs/18/routine-vacuuming.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:205",
+        "https://learn.microsoft.com/azure/postgresql/flexible-server/how-to-autovacuum-tuning"
+      ]
+    },
+    {
+      "name": "autovacuum_vacuum_insert_scale_factor",
+      "description": "insert-only 表的 vacuum 触发比例：insert threshold = autovacuum_vacuum_insert_threshold(1000) + scale × tuples × 未冻结页比例（PG18 行为，源码 autovacuum.c:3266-3267）",
+      "default_value": "0.2（PG13 新增；配套 insert_threshold=1000）",
+      "context": "sighup",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "insert-only 表的关键参数但认知度低：PG13 之前 insert-only 表永远不会被 autovacuum（无死元组）→visibility map 不更新、freeze 滞后、xid 回卷风险；默认 0.2 让时序表 freeze 滞后",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "0.1",
+          "origin": "官方公式 + Azure（PG13 起 insert-only 表才被 vacuum；0.05–0.1 区间，公式取上沿）",
+          "caveats": "insert-only/时序大表按表覆盖优先；必要时同步抬 insert_threshold（默认 1000）；真空过频也会产生额外 FPI/WAL"
+        }
+      ],
+      "version_notes": "PG13 新增（release notes：Allow inserts, not only updates and deletes, to trigger vacuuming activity in autovacuum，使 insert-only 表首次能被 vacuum：置 all-visible 位 + 提前 freeze）；PG18 表述改为按未冻结页比例计",
+      "sources": [
+        "https://www.postgresql.org/docs/13/runtime-config-autovacuum.html",
+        "https://www.postgresql.org/docs/18/runtime-config-autovacuum.html",
+        "https://www.postgresql.org/docs/13/release-13.html",
+        "postgres/src/backend/access/transam/autovacuum.c (autovacuum.c:3266)",
+        "https://learn.microsoft.com/azure/postgresql/flexible-server/how-to-autovacuum-tuning"
+      ]
+    },
+    {
+      "name": "autovacuum_vacuum_cost_delay",
+      "description": "autovacuum worker 的成本小睡间隔（比例睡眠 msec = delay × VacuumCostBalance / limit，上限 4×delay，睡后清零——源码 vacuum.c:2536-2615）",
+      "default_value": "2ms（PG12 起从 20ms 改为 2ms）",
+      "context": "sighup",
+      "restart_required": false,
+      "pain_level": "medium",
+      "why_hard": "设 0 让 vacuum 尽快跑完是 DBA 共识，但 0 会引发 vacuum 自身 FPI 洪峰冲垮 WAL/复制（ardentperf 实证：大 TOAST 表扫过后 hint bit 置位→检查点后 FPI 洪峰→复制延迟；回滚 2ms 后 everything smoothed out beautifully）；非 0 又拖慢 vacuum——两边都有坑。【分级分歧：社区痛点 low（PG12 已缓解）、WAL 主题 medium，合并取最严】",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "2",
+          "origin": "官方默认 + ardentperf 反面案例（1ms 的 delay 就能防止 vacuum 淹没系统）+ Citus/Azure",
+          "caveats": "输出 ms；跟不上时先抬 cost_limit 而非清零 delay；仅盘余量充足（NVMe）且确认无风暴风险才 0；wraparound 急救可 0+高 limit（Azure）；运行中的 worker 不吃 reload 新值；吞吐核算公式见 autovacuum_vacuum_cost_limit"
+        }
+      ],
+      "version_notes": "PG12 起默认 2ms（release notes：Reduce the default value of autovacuum_vacuum_cost_delay to 2ms；PG11 为 20ms）；个别博客写『默认 2000』是错误（那是 cost_limit 的讹传）",
+      "sources": [
+        "https://www.postgresql.org/docs/19/runtime-config-vacuum.html",
+        "https://www.postgresql.org/docs/release/12.0/",
+        "postgres/src/backend/commands/vacuum.c:2536-2615",
+        "https://ardentperf.com/2026/04/12/zero-autovacuum_cost_delay-write-storms-and-you",
+        "https://www.citusdata.com/blog/2022/07/28/debugging-postgres-autovacuum-problems-13-tips",
+        "https://learn.microsoft.com/azure/postgresql/flexible-server/how-to-autovacuum-tuning"
+      ]
+    },
+    {
+      "name": "io_method",
+      "description": "PG18 异步 I/O 方法（sync / worker / io_uring；io_uring 需 --with-liburing 构建）",
+      "default_value": "worker（PG18 新增）",
+      "context": "postmaster",
+      "restart_required": true,
+      "pain_level": "medium",
+      "why_hard": "io_uring 常被 Docker 默认 seccomp profile（25.0 起封禁 io_uring 系统调用）与内核 kernel.io_uring_disabled 限制，启动才报错，工具难以预判",
+      "rules": [
+        {
+          "inputs": ["os_type", "liburing_available"],
+          "formula": "'io_uring' if os_type == 'linux' and liburing_available else 'worker'",
+          "origin": "PGTune（PG18 Linux 建议 io_uring 并附 liburing/内核/容器警告）+ pgconfig（worker）",
+          "caveats": "liburing_available 需在目标环境实测（构建选项 + kernel.io_uring_disabled + 容器 seccomp）；探测不可靠时保持默认 worker"
+        }
+      ],
+      "version_notes": "PG18 新增（commit 02844012b）；默认 worker（aio.h:42 DEFAULT_IO_METHOD）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+        "https://www.postgresql.org/docs/18/release-18.html",
+        "postgres/src/include/storage/aio.h:42",
+        "postgres/configure.ac:1019-1022",
+        "https://github.com/le0pard/pgtune"
+      ]
+    },
+    {
+      "name": "io_workers",
+      "description": "io_method=worker 模式的 I/O worker 进程数（仅 PG18 存在）",
+      "default_value": "3（仅 PG18；PG19 起被 io_min_workers=2 / io_max_workers=8 取代）",
+      "context": "sighup（PG18；两份笔记正文均误记 postmaster——sighup 之说出自调研结构化结果，本次修订经 git show REL_18_BETA1:src/backend/utils/misc/guc_tables.c 实测确认 PGC_SIGHUP（:3309-3310）；见总报告 §3 #3）",
+      "restart_required": false,
+      "restart_required_note": "按实测 sighup 无需重启（reload 可改）；笔记正文的 postmaster/需重启记载有误",
+      "pain_level": "medium",
+      "why_hard": "PG18 刚引入即在 PG19 被 io_min_workers/io_max_workers 机制取代（PG19 官方文档确认），跨版本迁移知识快速过期",
+      "rules": [
+        {
+          "inputs": ["cpu_cores", "pg_version"],
+          "formula": "min(32, cpu_cores // 4) if pg_version == 18 else None",
+          "origin": "PGTune（PG18 worker 模式；>默认 3 才显式输出；io_uring 模式不用）",
+          "caveats": "PG19 起改写 io_max_workers（默认 8）"
+        },
+        {
+          "inputs": ["cpu_cores", "workload_type", "disk_type", "pg_version"],
+          "formula": "min(cpu_cores, max(2, ceil(cpu_cores * ({'desktop': 0.1, 'web': 0.2, 'mixed': 0.25, 'oltp': 0.3, 'dw': 0.4}[workload_type] + (0.1 if disk_type == 'hdd' else 0))))) if pg_version == 18 else None",
+          "origin": "pgconfig.org rules.rs aio()（实测 f≈0.3125 量级：32cpu→10、8cpu→3）",
+          "caveats": "部署版 API 对低版本也输出（版本门控失效，t5 实测确认），消费时必须自行按 pg_version==18 门控；2026-11 应用验证修复：仅 PG18 输出，19+ 该参数已被 io_max_workers 取代"
+        }
+      ],
+      "version_notes": "仅 PG18 存在；PG19/20devel 改为 io_min_workers（默认 2）/io_max_workers（默认 8）——PG19 官方文档 + 20devel 源码 guc_parameters.dat:1400/1416 双重确认（20devel 中两者已为 SIGHUP）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+        "postgres/src/backend/utils/misc/guc_tables.c:3309-3310 (REL_18_BETA1)",
+        "postgres git 55b454d0e1 (aio: Infrastructure for io_method=worker, 2025-03-18)",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:1400",
+        "https://github.com/le0pard/pgtune",
+        "https://github.com/momoi-labs/pgconfig"
+      ]
+    },
+    {
+      "name": "hash_mem_multiplier",
+      "description": "哈希类节点（hash join/hash agg/memoize）相对 work_mem 的内存倍数",
+      "default_value": "PG13.0–14：1.0；PG15+：2.0",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "low",
+      "why_hard": "PG15 起默认 2.0 悄悄把哈希节点预算翻倍——PG14→15 升级后内存上涨常被误算到 work_mem 头上；做内存预算时容易被漏乘",
+      "rules": [
+        {
+          "inputs": ["work_mem_mb"],
+          "formula": "2.0",
+          "origin": "官方默认 + 文档原文（Higher settings in the range of 2.0 - 8.0 or more may be effective in environments where work_mem has already been increased to 40MB or more）",
+          "caveats": "保持默认；官方文档：work_mem 已增至 40MB 或更多的环境 2.0–8.0 或更高可能有收益（该句未见于六份笔记正文、出自调研结构化交接结果；本次修订在本地 PG 文档源 postgres/doc/src/sgml/config.sgml:2065 核对到原文，引用链已补——总报告 §3 #14）；实验前须重做 OOM 核算：hash 节点内存 = work_mem × hash_mem_multiplier"
+        }
+      ],
+      "version_notes": "PG12 及以前不存在；PG13.0 起存在、默认 1.0（现行 /docs/13 文档页与 PG13 release notes 均含该参数，本次抓取核对；git：引入提交 d6c08e29e7 Add hash_mem_multiplier GUC.（2020-07-29）落在 configure.ac=14devel 的树上、不在 REL_13_BETA1（beta 早于提交）、首个含它的 tag 为 REL_14_BETA1——经 backpatch 进入 v13 稳定分支后随 13.0 发布；本地仓库无 v13 稳定分支 ref，backpatch 提交未能直接核对，如实注明；语料对引入版本三说并存，见总报告 §3 #13）；PG15 起默认 2.0（release notes：Increase hash_mem_multiplier default to 2.0 (Peter Geoghegan)）——从 PG14 升级到 PG15 后 hash 内存上限静默上涨",
+      "sources": [
+        "https://www.postgresql.org/docs/13/runtime-config-resource.html",
+        "https://www.postgresql.org/docs/release/15.0/",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:1220",
+        "postgres git d6c08e29e7 (Add hash_mem_multiplier GUC., 2020-07-29)",
+        "postgres/doc/src/sgml/config.sgml:2065 (work_mem>=40MB 时 2.0-8.0 可能有效原文)",
+        "https://www.postgresql.org/docs/13/release-13.html"
+      ]
+    },
+    {
+      "name": "autovacuum_work_mem",
+      "description": "autovacuum worker 专用内存（-1 跟随 maintenance_work_mem）",
+      "default_value": "-1（跟随 maintenance_work_mem）",
+      "context": "sighup",
+      "restart_required": false,
+      "pain_level": "low",
+      "why_hard": "autovacuum 总内存 = autovacuum_work_mem × autovacuum_max_workers——调大 maintenance_work_mem 不设它会被 worker 数倍乘放大（PGTune 源码注释：3-5 个后台 worker 各吃满会 severe OOM）",
+      "rules": [
+        {
+          "inputs": ["maintenance_work_mem_kb"],
+          "formula": "min(maintenance_work_mem_kb, 1048576)",
+          "origin": "PGTune selectAutovacuumWorkMem（源码：仅 mwm>1GB 时输出 1GB 上限）",
+          "caveats": "输出 kB；PG17 前 vacuum 死元组存储内部 1GB 上限（超配无效）"
+        },
+        {
+          "inputs": ["total_ram_gb"],
+          "formula": "max(131072, int(total_ram_gb * 1073741824 / 32768))",
+          "origin": "AWS Aurora 默认参数组 GREATEST(DBInstanceClassMemory/32768, 131072) kB",
+          "caveats": "输出 kB；=max(RAM/32, 128MB)"
+        }
+      ],
+      "version_notes": "PG13–18 稳定 -1；PG17 TID store 重构后 vacuum 对其敏感性下降（1GB 隐性上限移除）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:291",
+        "https://github.com/le0pard/pgtune",
+        "https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraPostgreSQL.Reference.ParameterGroups.html"
+      ]
+    },
+    {
+      "name": "temp_buffers",
+      "description": "会话临时表访问缓冲上限",
+      "default_value": "8MB",
+      "context": "user（仅会话首次使用临时表前可改）",
+      "restart_required": false,
+      "pain_level": "low",
+      "why_hard": "几乎无害：未使用的 buffer 只占约 64 字节描述符（文档原文），抱怨很少",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "8192",
+          "origin": "官方默认（低风险，不动）",
+          "caveats": "输出 kB"
+        }
+      ],
+      "version_notes": "长期稳定 8MB（1024 blocks）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:3063"
+      ]
+    },
+    {
+      "name": "max_parallel_maintenance_workers",
+      "description": "CREATE INDEX（B-tree/GIN/BRIN）与不带 FULL 的 VACUUM 的并行 worker 上限；maintenance_work_mem 为整条命令共享、不随 worker 数倍增（官方原文）",
+      "default_value": "2",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "low",
+      "why_hard": "坑较少——维护内存共享不倍增；仅两类维护命令起作用",
+      "rules": [
+        {
+          "inputs": ["cpu_cores"],
+          "formula": "min(ceil(cpu_cores / 2), 4)",
+          "origin": "PGTune selectParallelSettings（PG≥11 输出）",
+          "caveats": "与 max_worker_processes 池联动"
+        }
+      ],
+      "version_notes": "PG11 引入；PG13–18 稳定 2",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:2063",
+        "https://github.com/le0pard/pgtune"
+      ]
+    },
+    {
+      "name": "min_parallel_index_scan_size",
+      "description": "索引侧并行扫描最小数据量阈值；与表侧同按 3 倍几何级数计算并取 Min；还用于判断索引能否参与 parallel vacuum（文档原文）",
+      "default_value": "512kB",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "low",
+      "why_hard": "一般很少动（与表侧阈值联动决定自动并行度）",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "512",
+          "origin": "官方默认（Crunchy：真实负载别动）",
+          "caveats": "输出 kB"
+        }
+      ],
+      "version_notes": "长期稳定 512kB（allpaths.c:5031-5038 与表侧取 Min 已核对）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:2244",
+        "postgres/src/backend/optimizer/path/allpaths.c:5031"
+      ]
+    },
+    {
+      "name": "min_wal_size",
+      "description": "WAL 段回收阈值——低于此值时 WAL 段在 checkpoint 时回收而非删除（吸收用量尖峰）",
+      "default_value": "80MB",
+      "context": "sighup",
+      "restart_required": false,
+      "pain_level": "low",
+      "why_hard": "偶发 WAL 段反复删除/新建的抖动（batch 任务后 WAL 尖峰）",
+      "rules": [
+        {
+          "inputs": ["workload_type"],
+          "formula": "{'web': 1024, 'mixed': 1024, 'oltp': 2048, 'dw': 4096, 'desktop': 100}[workload_type]",
+          "origin": "PGTune selectCheckpointSegments（源码核对；与 max_wal_size 保持 1:4）",
+          "caveats": "输出 MB；pgconfig 的 Mixed 档为 2GB（分歧点，如实并列）"
+        }
+      ],
+      "version_notes": "PG13–18 稳定 80MB（boot_val=DEFAULT_MIN_WAL_SEGS 5×16MB）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-wal.html",
+        "postgres/src/include/access/xlog_internal.h:90",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:2264",
+        "https://github.com/le0pard/pgtune"
+      ]
+    },
+    {
+      "name": "wal_buffers",
+      "description": "WAL 共享缓冲；-1 自动 = shared_buffers/32，钳制 [64kB, 16MB]（一个 WAL 段）",
+      "default_value": "-1（自动）",
+      "context": "postmaster",
+      "restart_required": true,
+      "pain_level": "low",
+      "why_hard": "-1 自动值已与社区推荐公式一致，调它收益很小；busy server 上几 MB 已足够（每次 commit 都会刷出）",
+      "rules": [
+        {
+          "inputs": ["shared_buffers_kb"],
+          "formula": "min(16384, max(64, shared_buffers_kb // 256 * 8))",
+          "origin": "PGTune selectWalBuffers（源码逐字复刻官方 -1 自动算法：floor((sb/32)/8)*8，clamp [64kB,16MB]）",
+          "caveats": "输出 kB；与官方 wal_buffers=-1 等价，显式写出仅为可读性；postmaster 级需重启——自动化工具保持 -1 即可"
+        },
+        {
+          "inputs": ["workload_type", "shared_buffers_kb"],
+          "formula": "65536 if workload_type == 'dw' else (32768 if workload_type == 'oltp' and shared_buffers_kb > 8388608 else None)",
+          "origin": "pgconfig.org rules.rs（DW 显式 64MB、OLTP 大内存机 32MB——有意超出 -1 语义；API 实测）",
+          "caveats": "输出 kB；显式 64MB 会真正生效（PG 内部 -1 的 16MB 上限不再适用），写配置时注意"
+        }
+      ],
+      "version_notes": "长期稳定 -1",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-wal.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:3458",
+        "https://github.com/le0pard/pgtune",
+        "https://github.com/momoi-labs/pgconfig"
+      ]
+    },
+    {
+      "name": "bgwriter_delay",
+      "description": "bgwriter 轮询间隔（家族参数：bgwriter_lru_maxpages=100、bgwriter_lru_multiplier=2.0、bgwriter_flush_after=512kB Linux）",
+      "default_value": "200ms",
+      "context": "sighup",
+      "restart_required": false,
+      "pain_level": "low",
+      "why_hard": "参数本身少被诟病；真正的坑是 PG17 起 pg_stat_bgwriter 的 checkpoint 列移入新视图 pg_stat_checkpointer、buffers_backend(_fsync) 列被删除——旧监控脚本和经验阈值全部失效",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "200",
+          "origin": "官方默认（四个 bgwriter_* 参数 PG13–20devel 全部存在且默认一致，源码+PG13/18 文档核对）",
+          "caveats": "输出 ms；调优反馈改用 pg_stat_checkpointer（PG17+）/pg_stat_io（PG16+，backend 自写占比高=bgwriter 没跟上）；checkpointer 的检查点写盘节流 sleep 固定 100ms、与 bgwriter_delay 无关（源码注释）"
+        }
+      ],
+      "version_notes": "长期稳定 200ms（范围 10ms–10000ms）；PG17 监控拆分（release notes：Remove buffers_backend and buffers_backend_fsync from pg_stat_bgwriter…Create system view pg_stat_checkpointer）；PG18 又新增 num_done/slu_written 列",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+        "https://www.postgresql.org/docs/release/17/",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:337",
+        "postgres/src/backend/postmaster/checkpointer.c:823-829"
+      ]
+    },
+    {
+      "name": "commit_delay",
+      "description": "group commit 攒批延迟（仅当即将 flush WAL 时至少有 commit_siblings(5) 个其他活跃事务才睡 delay μs）",
+      "default_value": "0（μs）",
+      "context": "superuser（PG13 起可 per-database）",
+      "restart_required": false,
+      "pain_level": "low",
+      "why_hard": "窄场景参数：小事务 + WAL flush IOPS 接近盘上限才有效；值小了无效（100μs 仅 +16%）、大了反噬（1250μs 起回落）；几乎无人调对（Cybertec：commit_delay is not easy to tune）",
+      "rules": [
+        {
+          "inputs": ["avg_txn_ms", "wal_flush_iops_near_limit", "concurrent_commits"],
+          "formula": "1000 if (avg_txn_ms < 5 and wal_flush_iops_near_limit and concurrent_commits >= 5) else 0",
+          "origin": "Cybertec 基准（PG17、NVMe 限速 1000 IOPS：0μs=1576 tps → 1000μs=2738 tps（+74%）；1250μs=2508 回落）+ 官方文档（commit_siblings 条件；fsync=off 时无效）",
+          "caveats": "输出 μs；每事务延迟增加 ≤commit_delay；Cybertec：若可接受丢事务，synchronous_commit=off 比调 commit_delay 更有效"
+        }
+      ],
+      "version_notes": "长期稳定 0（范围 0–100000μs）；commit_siblings 默认 5（user context）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-wal.html",
+        "https://www.cybertec-postgresql.com/en/commit_delay-performance-postgresql-benchmark/"
+      ]
+    },
+    {
+      "name": "superuser_reserved_connections",
+      "description": "为 superuser 预留的连接数（连接数达 max_connections−reserved 后仅 superuser 可连入）",
+      "default_value": "3",
+      "context": "postmaster",
+      "restart_required": true,
+      "pain_level": "low",
+      "why_hard": "基本无人动默认 3，只在连接耗尽救急时才被想起",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "3",
+          "origin": "官方默认（t4 R14：保持 3；工具仅做 ≥1 且 < max_connections−reserved_connections 校验）",
+          "caveats": "PG16 起另有 reserved_connections（按角色预留）"
+        }
+      ],
+      "version_notes": "长期稳定 3",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-connection.html",
+        "guc_research/wal-bgwriter.md (internal, historical)"
+      ]
+    },
+    {
+      "name": "cursor_tuple_fraction",
+      "description": "游标场景下规划器假设会被取出的行比例（0.1=偏向快速返回首行的 fast-start 计划；1.0 时游标按普通查询精确规划）",
+      "default_value": "0.1",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "low",
+      "why_hard": "仅游标场景生效，但使游标计划与普通执行计划不一致（EXPLAIN 与实际 FETCH 行为不符的困惑源）；取全量时总时长更差",
+      "rules": [
+        {
+          "inputs": ["cursor_usage"],
+          "formula": "1.0 if cursor_usage == 'full_fetch' else 0.1",
+          "origin": "官方文档（fast-start 偏置说明）",
+          "caveats": "cursor_usage∈{full_fetch, interactive}；非交互式应用（游标始终取全量）改 1.0 收益明显"
+        }
+      ],
+      "version_notes": "长期稳定 0.1（范围 0.0–1.0）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:572"
+      ]
+    },
+    {
+      "name": "cpu_tuple_cost",
+      "description": "处理一个元组的 CPU 代价（每个过滤条件按 cpu_operator_cost 计价）",
+      "default_value": "0.01",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "low",
+      "why_hard": "默认意味着『处理一元组比随机读一页便宜 400 倍』——对全内存负载系统性失衡（Leis），但极少有人动；改 CPU 系影响全部计划需回归验证",
+      "rules": [
+        {
+          "inputs": ["db_size_gb", "total_ram_gb"],
+          "formula": "0.5 if db_size_gb < total_ram_gb else 0.01",
+          "origin": "Leis PVLDB 2015 §5.3（CPU 参数整体 ×50 实验：成本预测中位误差 38%→30%；0.5=0.01×50）",
+          "caveats": "激进方案，仅当数据集确定常驻内存；配套 cpu_index_tuple_cost=0.25、cpu_operator_cost=0.125（同 ×50）；等价方向为 random=seq_page_cost=1.0 并相对调低 I/O 常数（官方 Tip）"
+        },
+        {
+          "inputs": [],
+          "formula": "0.03",
+          "origin": "OtterTune CIDR 2017 附录 DBA 手工配置（温和版：只抬 cpu_tuple_cost 3 倍）",
+          "caveats": "与 Leis ×50 相比的温和校准"
+        }
+      ],
+      "version_notes": "长期稳定 0.01（cost.h:26）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/include/optimizer/cost.h:26",
+        "http://www.vldb.org/pvldb/vol9/p204-leis.pdf",
+        "https://db.cs.cmu.edu/papers/2017/p1009-van-aken.pdf"
+      ]
+    },
+    {
+      "name": "cpu_index_tuple_cost",
+      "description": "处理一个索引项的 CPU 代价",
+      "default_value": "0.005",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "low",
+      "why_hard": "与 cpu_tuple_cost 同源的低估（全内存负载失衡），通常随 CPU 常数整体调整",
+      "rules": [
+        {
+          "inputs": ["db_size_gb", "total_ram_gb"],
+          "formula": "0.25 if db_size_gb < total_ram_gb else 0.005",
+          "origin": "Leis PVLDB 2015 §5.3（CPU 参数 ×50：0.005×50=0.25）",
+          "caveats": "与 cpu_tuple_cost/cpu_operator_cost 同批调整"
+        }
+      ],
+      "version_notes": "长期稳定 0.005（cost.h:27）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/include/optimizer/cost.h:27",
+        "http://www.vldb.org/pvldb/vol9/p204-leis.pdf"
+      ]
+    },
+    {
+      "name": "cpu_operator_cost",
+      "description": "每次运算符/函数调用的 CPU 代价；兼作众多内部成本的换算单位（如索引 AM 开销模型 indexam.sgml:1473）",
+      "default_value": "0.0025",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "low",
+      "why_hard": "数值本身少被诟病，但它是内部计价换算单位，牵一发动全身",
+      "rules": [
+        {
+          "inputs": ["db_size_gb", "total_ram_gb"],
+          "formula": "0.125 if db_size_gb < total_ram_gb else 0.0025",
+          "origin": "Leis PVLDB 2015 §5.3（CPU 参数 ×50：0.0025×50=0.125）",
+          "caveats": "与 cpu_tuple_cost 同批调整"
+        }
+      ],
+      "version_notes": "长期稳定 0.0025（cost.h:28）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/include/optimizer/cost.h:28",
+        "postgres/doc/src/sgml/indexam.sgml:1473",
+        "http://www.vldb.org/pvldb/vol9/p204-leis.pdf"
+      ]
+    },
+    {
+      "name": "seq_page_cost",
+      "description": "顺序读一页的代价——全模型的刻度锚点（官方：其他成本常数以它为参照设定）；可按 tablespace 覆盖",
+      "default_value": "1.0",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "low",
+      "why_hard": "几乎不该动；抱怨集中在『没意识到其他常数要以它为参照』",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "1.0",
+          "origin": "官方文档（seq_page_cost is conventionally set to 1.0 and the other cost variables are set with reference to that）",
+          "caveats": "全内存场景与 random_page_cost 同设 1.0（官方 Tip）；真正的调节量是 random/seq 比值"
+        }
+      ],
+      "version_notes": "长期稳定 1.0（cost.h:24）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-query.html",
+        "postgres/src/include/optimizer/cost.h:24"
+      ]
+    },
+    {
+      "name": "wal_sync_method",
+      "description": "WAL 刷盘系统调用（open_datasync/fdatasync/fsync/fsync_writethrough/open_sync）",
+      "default_value": "fdatasync（Linux/FreeBSD 平台默认；其余平台取支持列表第一个）",
+      "context": "sighup",
+      "restart_required": false,
+      "pain_level": "low",
+      "why_hard": "各方法差异常在个位数百分比，需 pg_test_fsync 实测才知道；虚拟化存储栈影响大（WSL2 上 fsync≈1.2ms，比裸 NVMe 慢一个数量级）",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "'fdatasync'",
+          "origin": "官方默认（linux.h:22 PLATFORM_DEFAULT_WAL_SYNC_METHOD）+ pg_test_fsync 校准法（官方工具，本调研 WSL2 实测：open_datasync 868.9 vs fdatasync 848.4 ops/s，差异 <5% 保持默认）",
+          "caveats": "pg_test_fsync -s 2 -f <pgdata>/fsync_testfile 实测，取 ops/sec 最高者为候选；差异 <5% 保持默认，显著（如 open_datasync 快 2×+）才改；用完删除测试文件；fsync_writethrough 可能 n/a"
+        }
+      ],
+      "version_notes": "长期稳定；Windows 已移除 fsync_writethrough 候选（PG18 文档）",
+      "sources": [
+        "https://www.postgresql.org/docs/18/runtime-config-wal.html",
+        "https://www.postgresql.org/docs/18/pgtestfsync.html",
+        "postgres/src/include/port/linux.h:22",
+        "postgres/src/bin/pg_test_fsync"
+      ]
+    },
+    {
+      "name": "maintenance_io_concurrency",
+      "description": "维护操作（vacuum 预取等）的 I/O 并发度（PG13 引入，由 effective_io_concurrency 派生重命名）",
+      "default_value": "PG13–17：10（无 posix_fadvise 平台为 0）；PG18 起：16",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": "low",
+      "why_hard": "存在感低、默认值小，多数调优指南一笔带过甚至漏配",
+      "rules": [
+        {
+          "inputs": ["disk_type", "pg_version"],
+          "formula": "{'hdd': 2, 'ssd': 200, 'cloud': 300, 'nvme': 1000}[disk_type]",
+          "origin": "PGTune（源码直接复用 effective_io_concurrency 值；pgconfig API 实测两者同值 200）",
+          "caveats": "仅 PG≥13 输出；官方文档无 SSD/NVMe 具体数值建议（仅 hundreds 定性）"
+        }
+      ],
+      "version_notes": "PG13 新增（release notes：Add maintenance_io_concurrency parameter，Thomas Munro）；PG18 默认 10→16（与 eio 同批 commit cc6be07eb）",
+      "sources": [
+        "https://www.postgresql.org/docs/13/release-13.html",
+        "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+        "postgres/src/include/storage/bufmgr.h:171",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:1954"
+      ]
+    },
+    {
+      "name": "io_combine_limit",
+      "description": "相邻 I/O 合并上限（流式读）；PG17 出现于文档，PG18 并入 AIO 并新增 postmaster 级 io_max_combine_limit",
+      "default_value": "128kB（PG17 起；PG13–16 无此参数）",
+      "context": "user",
+      "restart_required": false,
+      "pain_level": null,
+      "why_hard": "调研未单独评级（仅事实核对，无 pain 分级与调优公式）；PG17/18 语义随 AIO 改造演进",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "128",
+          "origin": "官方默认（PG17 文档收录；bufmgr.h:175 DEFAULT_IO_COMBINE_LIMIT）",
+          "caveats": "输出 kB；Unix 典型上限 1MB、Windows 128kB；pgconfig 对配套的 io_max_combine_limit/io_max_concurrency 给 {dw:(128,256), oltp:(16,128), 其他:(16,64)}（PG18+）"
+        }
+      ],
+      "version_notes": "PG17 起出现在文档（流式读取）；PG18 并入 AIO 并新增 io_max_combine_limit（postmaster，guc_parameters.dat:1381）",
+      "sources": [
+        "https://www.postgresql.org/docs/17/runtime-config-resource.html",
+        "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+        "postgres/src/include/storage/bufmgr.h:175",
+        "https://github.com/momoi-labs/pgconfig"
+      ]
+    },
+    {
+      "name": "huge_page_size",
+      "description": "显式大页页尺寸（0=系统默认，Linux 通常 2MB）",
+      "default_value": "0（PG14 引入；PG13 无此参数）",
+      "context": "postmaster",
+      "restart_required": true,
+      "pain_level": null,
+      "why_hard": "调研未单独评级（仅事实核对）；非默认值仅 Linux 支持；与 THP 概念易混淆",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "0",
+          "origin": "官方默认 + Percona 基准（库装得进 shared_buffers 时 1GB 大页 > 2MB > 4KB）",
+          "caveats": "保持 0 用系统默认；系统默认大页尺寸常见 2MB/1GB(x86)、16MB/16GB(POWER)、64kB–1GB(ARM)"
+        }
+      ],
+      "version_notes": "PG14 引入（commit d2bddc2500，2020-07-17，与 PG14 文档收录一致；PG13 文档无此参数——t6 逐版本核对，修正过搜索摘要的 PG16/17 误记）",
+      "sources": [
+        "https://www.postgresql.org/docs/14/runtime-config-resource.html",
+        "postgres/src/backend/utils/misc/guc_parameters.dat:1255",
+        "https://www.percona.com/blog/benchmark-postgresql-with-linux-hugepages/"
+      ]
+    }
+  ],
+  "hardware_probes": [
+    {
+      "name": "__probe__memory",
+      "description": "探测总内存（含容器 cgroup 与 WSL2 修正）：total_ram_bytes = min(MemTotal×1024, cgroup limit)",
+      "category": "hardware_probe",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "awk '/^MemTotal/{print $2}' /proc/meminfo; getconf _PHYS_PAGES; getconf PAGE_SIZE; cat /sys/fs/cgroup/memory.max 2>/dev/null; cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null",
+          "origin": "Linux sysfs/cgroup 约定 + Microsoft wsl-config 文档（WSL2 memory 默认=Windows 总内存 50%、swap=25%）",
+          "caveats": "formula 为 shell 命令串（非 Python 表达式）；容器内 /proc/meminfo 是宿主值，必须与 cgroup limit 取 min（cgroup v2 memory.max、v1 memory.limit_in_bytes；max/巨大值视为 ∞）；getconf 乘积与 MemTotal 交叉验证；本调研 WSL2 实测 MemTotal=8132520kB 与 getconf 乘积一致；WSL2 中 /proc/meminfo 是轻量 VM 配额而非宿主内存"
+        }
+      ],
+      "sources": [
+        "guc_research/hardware-probe.md (internal, historical)",
+        "https://learn.microsoft.com/en-us/windows/wsl/wsl-config"
+      ]
+    },
+    {
+      "name": "__probe__cpu",
+      "description": "探测 CPU 核数与拓扑（含 cgroup 配额修正）：effective_cores = min(在线核数, 配额核数, affinity 核数)",
+      "category": "hardware_probe",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "getconf _NPROCESSORS_ONLN; nproc; lscpu; cat /sys/fs/cgroup/cpu.max 2>/dev/null; cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null; cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null",
+          "origin": "Linux/cgroup v2 规范；本机 WSL2 实测 16 vCPU、2 socket、Thread/core=2",
+          "caveats": "formula 为 shell 命令串；cpu.max 格式 'MAX PERIOD'（max=不限）；nproc 受 sched_getaffinity 限制可能比 getconf 小；lscpu 的 Socket(s)/Core(s) per socket/Thread(s) per core/Hypervisor vendor 兼作虚拟化探测"
+        }
+      ],
+      "sources": ["guc_research/hardware-probe.md (internal, historical)"]
+    },
+    {
+      "name": "__probe__numa",
+      "description": "探测 NUMA 拓扑（sysfs 即可，无需 numactl）",
+      "category": "hardware_probe",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l; cat /sys/devices/system/node/node0/cpulist; head -4 /sys/devices/system/node/node0/meminfo; lscpu | grep NUMA",
+          "origin": "Linux sysfs NUMA 拓扑；本机实测单节点 node0 含全部 CPU（VM/WSL2 几乎总是合成单节点）",
+          "caveats": "formula 为 shell 命令串；PostgreSQL 无 NUMA 绑定 GUC，绑定需 numactl 启动参数；numactl --hardware 可选（缺省时 sysfs 完全等价）"
+        }
+      ],
+      "sources": ["guc_research/hardware-probe.md (internal, historical)"]
+    },
+    {
+      "name": "__probe__disk_flag",
+      "description": "第一级磁盘判型：sysfs rotational/model 字符串（快但虚拟化下不可信）",
+      "category": "hardware_probe",
+      "rules": [
+        {
+          "inputs": ["pgdata 路径"],
+          "formula": "DEV=$(lsblk -no PKNAME \"$(findmnt -no SOURCE <pgdata>)\" | head -1); cat /sys/block/$DEV/queue/rotational; cat /sys/block/$DEV/device/model; cat /sys/block/$DEV/device/vendor",
+          "origin": "kernel sysfs block 队列接口 + Red Hat Solution 7008833（RPM 字段机制）+ kernel bug 187281 / unix.SE 508497（不可靠性案例）",
+          "caveats": "formula 为 shell 命令串；rotational 来自 SCSI INQUIRY RPM 字段，虚拟盘/固件不报即保守为 1——本调研 WSL2 实测 4 盘（含 NVMe 背书 1TB VHDX）全 rotational=1、model='Virtual Disk'，只能判『虚拟盘』不能判介质；loop*/ram* 跳过；discard_granularity>0 是 SSD 弱辅助信号；云盘字符串：Amazon Elastic Block Store / Google Persistent Disk / Msft Virtual Disk"
+        }
+      ],
+      "sources": [
+        "guc_research/hardware-probe.md (internal, historical)",
+        "https://unix.stackexchange.com/questions/508497/",
+        "https://bugzilla.kernel.org/show_bug.cgi?id=187281"
+      ]
+    },
+    {
+      "name": "__probe__disk_fio",
+      "description": "第二级磁盘判型：fio 4k QD32 随机读分级（可信；无权威分界标准，属社区启发式）",
+      "category": "hardware_probe",
+      "rules": [
+        {
+          "inputs": ["pgdata 路径", "可写空间 ≥1GB", "30 秒窗口"],
+          "formula": "fio --name=probe --directory=<pgdata> --rw=randread --bs=4k --size=1G --direct=1 --iodepth=32 --numjobs=1 --runtime=30 --time_based --group_reporting; 辅助: 同参数 iodepth=1; --rw=read --bs=1M",
+          "origin": "fio 官方用法 + 社区典型数值（cubepath.com、serverfault 1161626）：HDD 数百、SATA SSD 数万、NVMe 数十万 IOPS",
+          "caveats": "formula 为 shell 命令串；判定阈值（QD32 direct=1）：<500→hdd；500–10k→cloud/slow_ssd（gp3 基线 3000 IOPS 落在此档）；10k–100k→sata_ssd；>100k→nvme；QD1 辅助：<300→hdd、>5k→固态；1M 顺序 >500MB/s 排除 HDD（HDD≈120–250MB/s）；必须 --direct=1 否则测到 page cache；无官方分界标准，工具应允许用户覆盖；容器内可能无 fio（本调研以等价 O_DIRECT 自制基准替代，实测 WSL2 4k QD1=10210 IOPS、1M seq=1949MB/s→判 SSD 类）"
+        }
+      ],
+      "sources": [
+        "guc_research/hardware-probe.md (internal, historical)",
+        "https://cubepath.com/docs/comparison-guide/ssd-vs-nvme-vs-hdd-performance-and-use-cases",
+        "https://serverfault.com/questions/1161626/"
+      ]
+    },
+    {
+      "name": "__probe__thp",
+      "description": "探测透明大页（THP）状态；与 PG 显式大页（MAP_HUGETLB）无关，官方文档不讨论 THP",
+      "category": "hardware_probe",
+      "rules": [
+        {
+          "inputs": [],
+          "formula": "cat /sys/kernel/mm/transparent_hugepage/enabled; cat /sys/kernel/mm/transparent_hugepage/defrag",
+          "origin": "Percona THP 博客（2020/2023）+ PGConf 2019 PostgreSQL and Huge Pages + Cybertec Huge Pages End to End（2026）；本机 WSL2 实测当前为 madvise",
+          "caveats": "formula 为 shell 命令串；输出形如 always [madvise] never（方括号为当前值）；always → 发警告建议改 never 或 madvise（echo never | sudo tee 该文件或 grub 加 transparent_hugepage=never；defrag 同理）；关 THP 是社区/厂商共识而非官方要求（PG 源码树内 grep 无 MADV_HUGEPAGE）"
+        }
+      ],
+      "sources": [
+        "guc_research/hardware-probe.md (internal, historical)",
+        "https://www.percona.com/blog/transparent-huge-pages-why-we-disable-it-for-databases/",
+        "https://wiki.postgresql.org/images/7/7d/PostgreSQL_and_Huge_pages_-_PGConf.2019.pdf"
+      ]
+    },
+    {
+      "name": "__fallback__strategy",
+      "description": "探测失败/不可信时的保守兜底策略（虚拟化、云盘、跨 OS 文件系统）",
+      "category": "hardware_probe",
+      "rules": [
+        {
+          "inputs": ["virt 探测结果", "findmnt fstype", "disk_type 探测结果"],
+          "formula": "systemd-detect-virt 2>/dev/null; grep -qi microsoft /proc/version && echo WSL2; findmnt -no FSTYPE <pgdata>",
+          "origin": "Microsoft compare-versions/wsl-config 官方文档 + unix.SE/kernel bug 187281 + 本机 WSL2 全套实测（rotational 全 1、pg_test_fsync、O_DIRECT 基准、cgroup/THP/hugepages 状态）",
+          "caveats": "formula 为 shell 命令串；兜底规则：fstype∈{9p,drvfs,fuse,overlay,virtiofs,nfs,cifs}→按网络/云盘处理（random_page_cost=4.0、effective_io_concurrency=1）并强警告（微软官方：WSL2 跨 OS 文件系统性能 ❌，数据目录绝不应放 /mnt/*）；介质未知→按 HDD 保守（4.0/1）；内存/CPU 一律取 cgroup 与虚拟化修正后的值；io_uring 需确认 seccomp/kernel.io_uring_disabled；云盘宁可 1.1 不降 1.0；WSL2 顺序吞吐接近裸盘但 fsync 慢一个数量级（848/s），对写密集负载的预期要单独修正"
+        }
+      ],
+      "sources": [
+        "guc_research/hardware-probe.md (internal, historical)",
+        "https://learn.microsoft.com/en-us/windows/wsl/compare-versions"
+      ]
+    }
+  ]
+}
