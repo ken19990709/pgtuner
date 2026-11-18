@@ -4,8 +4,11 @@ skeleton into **any project** (or the user's global scope).
 Why: the tool repo's self-contained knowledge layer (AGENTS.md/CLAUDE.md/skills) only takes
 effect for agents "working inside the pgtuner repo"; a new user opening an agent in their own
 project starts with zero knowledge. init is the distribution layer: the single style source =
-the packaged assets in pgtuner/assets (byte-for-byte copies of the repo-root originals —
-tests/test_packaging.py asserts the sync), copied/merged into the target project; SKILL.md is
+the packaged assets in pgtuner/assets — AGENTS.md is the bilingual merged edition built from
+the two repo-root language files with their language-switch lines stripped (the constructive
+concatenation is pinned by tests/test_packaging.py; regeneration command in CONTRIBUTING.md),
+while SKILL.md is a byte-for-byte copy of the repo-root original (same test file asserts the
+sync) — copied/merged into the target project; SKILL.md is
 an open cross-agent standard format — dropped into the skills directory of .zcode/.claude it
 is auto-discovered by ZCode/Claude Code (ecosystem-compatible with `npx skills add`-style
 installers). Packaging the assets (v0.11.0) made init work from wheel/sdist installs too;

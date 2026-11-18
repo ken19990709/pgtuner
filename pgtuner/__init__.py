@@ -17,8 +17,11 @@ information-architecture convergence (v0.11.0): help as the single source of
 truth (completing subcommand docstrings and prerequisite hints), AGENTS.md/
 SKILL.md slimmed into pure hooks, ZCode PreToolUse hook hard-blocking raw
 psql/pgbench.
-Unified documentation: README.md (English + zh-CN); agent iron rules: AGENTS.md
-(bilingual). CLI help is bilingual too: PGTUNER_LANG=en switches --help to English.
+Unified documentation: README.md + README.zh-CN.md (one language each); agent iron
+rules: AGENTS.md (English) + AGENTS.zh-CN.md (Chinese) at the repo root, with
+pgtuner/assets/AGENTS.md as the bilingual merged edition (language-switch lines
+stripped) that `pgtuner init` installs into user projects. CLI help is bilingual
+too: PGTUNER_LANG=en switches --help to English.
 """
 
 __version__ = "0.11.0"

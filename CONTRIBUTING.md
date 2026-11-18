@@ -1,8 +1,8 @@
 # Contributing to pgtuner
 
 Thanks for considering a contribution. The repo is deliberately small on documents
-— this file plus the READMEs, AGENTS.md and the CLI's own `--help` are the whole
-written surface — so a few invariants live here instead.
+— this file plus the READMEs, AGENTS.md / AGENTS.zh-CN.md and the CLI's own
+`--help` are the whole written surface — so a few invariants live here instead.
 
 ## Dev setup
 
@@ -23,11 +23,22 @@ green offline test run (psycopg2 is imported at module top by five test files).
   If you add or change any command/option help, update the matching
   `pgtuner/help_en/*` entry — `tests/test_help_i18n.py` fails on missing or stale
   keys automatically.
-- **Packaged assets must not drift.** `pgtuner/assets/AGENTS.md` and `SKILL.md`
-  are byte-for-byte copies of the repo-root originals (`AGENTS.md`,
-  `.zcode/skills/pg-experiment/SKILL.md`); `tests/test_packaging.py` asserts the
-  sync. Re-copy after editing the originals. Data files (`guc_knowledge.json`,
-  `template_setup.sql`) belong inside the package so wheel installs work.
+- **Packaged assets must not drift.** `pgtuner/assets/AGENTS.md` is the bilingual
+  contract shipped into user projects by `pgtuner init` — it is **generated** from the
+  two repo-root language files, each with its single language-switch line stripped
+  (that line's relative link is dead inside the package and inside user projects):
+  `strip(AGENTS.md) + "\n\n---\n\n" + strip(AGENTS.zh-CN.md)`. After editing either
+  root file, regenerate it (paste as-is, from the repo root):
+
+  ```bash
+  python3 -c "from pathlib import Path; e=Path('AGENTS.md').read_text(encoding='utf-8'); z=Path('AGENTS.zh-CN.md').read_text(encoding='utf-8'); Path('pgtuner/assets/AGENTS.md').write_text(e.replace('\n\n**English** | [简体中文](AGENTS.zh-CN.md)\n','\n')+'\n\n---\n\n'+z.replace('\n\n**简体中文** | [English](AGENTS.md)\n','\n'), encoding='utf-8')"
+  ```
+
+  `tests/test_packaging.py` pins the exact concatenation. `pgtuner/assets/SKILL.md`
+  remains a byte-for-byte copy of `.zcode/skills/pg-experiment/SKILL.md` (same test
+  file asserts the sync — re-copy after editing the original). Data files
+  (`guc_knowledge.json`, `template_setup.sql`) belong inside the package so wheel
+  installs work.
 - **Language conventions.** Code comments and docstrings: English. Runtime
   messages produced by pgtuner (tables, receipts, classified error hints):
   zh-CN for now (English i18n is on the roadmap). Click command docstrings are

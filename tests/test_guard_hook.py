@@ -234,29 +234,137 @@ def _nested_escaped_dquotes(n: int) -> str:
     return cmd
 
 
+def _run_timed(command: str) -> tuple:
+    """Same subprocess contract as _run, plus the wall-clock duration — the
+    feed for the hardware-normalized ratio budgets below."""
+    stdin = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+    t = time.monotonic()
+    p = subprocess.run([sys.executable, str(SCRIPT)], input=stdin,
+                       capture_output=True, text=True)
+    return p.returncode, time.monotonic() - t
+
+
+def _run_timed_min(command: str, repeat: int = 3) -> float:
+    """min of `repeat` timed runs of the same command — the contention-robust
+    estimator for the ratio budgets (why min and not mean/median: a single
+    sample per side compares MISMATCHED conditions under CPU contention —
+    see test_deeply_nested_payload_denied_quickly for the B2 evidence)."""
+    return min(_run_timed(command)[1] for _ in range(repeat))
+
+
+def _flat_payload_baseline(size: int) -> str:
+    """A same-size FLAT baseline command: ONE `bash -c` payload of plain
+    data, no nesting — the linear-scan cost of the same number of bytes
+    minus the nesting, i.e. the reference the ratio budgets compare
+    against. (A giant `echo <arg>` would NOT work as a baseline: the scan
+    correctly stops at the ordinary command word `echo` and never touches
+    the giant argument, so it would measure process spawn, not scanning.)"""
+    return "bash -c '" + "a" * (size - 10) + "'"
+
+
 def test_deeply_nested_payload_denied_quickly():
     """Adversarial review R3-D3.3: deeply nested `bash -c "..."` chains
     used to run the hook into a timeout (fail-open) or OOM. They must be
     DENIED, fast — the 22-level re-escaped chain is an 8 MB command line.
-    C8-F4: budgets are per-case now — the 8 MB fixture alone measured
-    ~1.36 s (total ~1.48 s) against the old flat < 2.0 s cap, leaving
-    almost no margin on slow CI (flaky); 2.0 s per case is ~1.4x
-    headroom over the worst fixture, and the 4.0 s total budget keeps
-    >2x headroom over the measured sum — enough to catch any accidental
-    blow-up of the linear/C-speed parse without flaking (C9-F4: stated
-    honestly, the per-case margin is NOT >2x)."""
+    C8-F4 then pinned per-case absolute budgets (<2.0 s per case, <4.0 s
+    total) — which measured 1.9 s locally but 2.8–7.3 s on GitHub 2-core
+    CI runners, reddening the whole matrix: absolute wall-clock budgets
+    are UNSAFE on slow hardware (the lesson of that round, stated
+    plainly). Replaced by hardware-normalized checks: every fixture still
+    denies; each multi-KB fixture must stay under 3x the time of a
+    SAME-SIZE flat baseline (see _flat_payload_baseline — the
+    hardware-independent form of "no superlinear blow-up"); one loose
+    absolute total (<15 s) survives purely as a pathological-hang
+    backstop. The 8 MB fixture is O(1)-rejected by the input-size cap now
+    (see test_oversized_input_rejected_in_constant_time), so both sides
+    of its ratio are constant-time today — if the cap is ever lifted the
+    same ratio re-arms as a real linear-vs-nested scan comparison.
+    Review B2 then broke the SINGLE-sample ratio under CPU contention
+    (measured: a 30-sample stress run put 2 ratios ≥ 3.0, and the same
+    load reddened 1 of 6 real pytest runs — failure shape: the flat
+    baseline's one sample lands in a quiet window while the nested side's
+    one sample eats contention, i.e. mismatched conditions, not a real
+    blow-up). Both sides therefore run 3x and take the min (k stays 3):
+    min filters contention spikes, letting each side catch its own quiet
+    window so the ratio compares quiet-vs-quiet; taking min on the nested
+    side is also safe — a genuinely superlinear scan stays slow in every
+    sample, so min cannot manufacture a false pass."""
     t0 = time.monotonic()
-    cases = (
-        (_nested_alt_quotes(21), "beyond the 20-level rescan cap"),
+    scanned = (                                          # under the 1 MiB size cap: really scanned
+        (_nested_alt_quotes(21), "alternating-quote nesting beyond the 20-level cap, 352 KB"),
+        (_nested_escaped_dquotes(18), "real bash recursion shape, 512 KB (under the cap)"),
+    )
+    size_capped = (
+        (_nested_escaped_dquotes(22), "real bash recursion shape, 8 MB (O(1) size-cap deny)"),
+    )
+    quick = (
         ("bash -c 'bash -c \"psql\"'; " * 1000, "linear-size deep chain (1000x2 levels)"),
         ("bash -c " * 60 + "psql", "flat repeated shells"),
-        (_nested_escaped_dquotes(22), "real bash recursion shape, 8 MB"),
     )
-    for cmd, note in cases:
-        t1 = time.monotonic()
-        assert _run(cmd) == 2, note                       # per-case budget (C8-F4)
-        assert time.monotonic() - t1 < 2.0, note
-    assert time.monotonic() - t0 < 4.0                    # total budget (C8-F4)
+    for cmd, note in scanned + size_capped + quick:
+        assert _run(cmd) == 2, note                      # R3-D3.3: deny, never time out
+    for cmd, note in scanned + size_capped:
+        t_nested = _run_timed_min(cmd)                   # min-of-3 each side (B2): ratio vs
+        t_flat = _run_timed_min(_flat_payload_baseline(len(cmd)))   # same-size flat baseline
+        assert t_nested < 3 * t_flat, note
+    assert time.monotonic() - t0 < 15.0                  # pathological-hang backstop ONLY
+
+
+def test_oversized_input_rejected_in_constant_time():
+    """Input-size fast-reject (this round's CI-portability fix): commands
+    longer than _MAX_COMMAND_CHARS (1 Mi characters = 8x the Linux
+    MAX_ARG_STRLEN of 128 KiB per single argument string — no real command
+    line can be that long) are denied fail-closed BEFORE any scanning, so
+    multi-MB pathological samples cost O(1) regardless of content (this
+    fixture has no psql at all and is still denied — the gate judges size,
+    not content). The DETERMINANT of this test is the rejection message
+    (the size deny asserted below); the absolute timer is only a
+    pathological-hang backstop, not a performance claim — B2's loaded-CPU
+    run measured 0.76 s worst-case (a mere 1.3x margin against the old
+    1.0 s), so the backstop sits at 3.0 s. The O(1) path itself still
+    does no per-character work (spawn + C-speed JSON parse only); the
+    exact-cap boundary is still scanned, not size-rejected, and a clean
+    command there allows as before."""
+    sys.path.insert(0, str(SCRIPT.parent))
+    import guard_raw_cli as g
+    oversized = "echo '" + "a" * g._MAX_COMMAND_CHARS + "'"    # cap+7 chars (B2 nit: not "one")
+    assert len(oversized) > g._MAX_COMMAND_CHARS
+    t = time.monotonic()
+    stdin = json.dumps({"tool_input": {"command": oversized}})
+    p = subprocess.run([sys.executable, str(SCRIPT)], input=stdin,
+                       capture_output=True, text=True)
+    assert p.returncode == 2 and "pgtuner --help" in p.stderr   # fail-closed, with the pointer
+    assert time.monotonic() - t < 3.0                           # hang backstop only (see docstring)
+    at_cap = "echo '" + "a" * (g._MAX_COMMAND_CHARS - 7) + "'"  # exactly at the cap
+    assert len(at_cap) == g._MAX_COMMAND_CHARS
+    assert _run(at_cap) == 0                                   # boundary not size-rejected: scanned, clean
+
+
+def test_size_cap_edge_pins():
+    """Review B2: two size-cap behaviors lived only in comments — pin them.
+    (1) The `# allow-raw-psql` escape hatch does NOT apply past the cap:
+    the size gate runs before the escape-tail scan, so an oversized
+    command with the hatch at its tail is still denied WITH THE SIZE
+    MESSAGE (a >1 MiB "command" cannot be executed by the shell anyway —
+    the hatch would only ever disarm a scan that never happens).
+    (2) A command exactly AT the cap is NOT size-rejected: it walks the
+    normal scan path, so a banned word there denies with the ORDINARY
+    message, not the size one."""
+    sys.path.insert(0, str(SCRIPT.parent))
+    import guard_raw_cli as g
+    oversized = "echo '" + "a" * g._MAX_COMMAND_CHARS + "' # allow-raw-psql"
+    assert len(oversized) > g._MAX_COMMAND_CHARS
+    stdin = json.dumps({"tool_input": {"command": oversized}})
+    p = subprocess.run([sys.executable, str(SCRIPT)], input=stdin,
+                       capture_output=True, text=True)
+    assert p.returncode == 2 and g._SIZE_MSG in p.stderr       # size deny; hatch not applied
+    at_cap = "psql -c '" + "a" * (g._MAX_COMMAND_CHARS - 10) + "'"   # exactly at the cap
+    assert len(at_cap) == g._MAX_COMMAND_CHARS
+    stdin = json.dumps({"tool_input": {"command": at_cap}})
+    p = subprocess.run([sys.executable, str(SCRIPT)], input=stdin,
+                       capture_output=True, text=True)
+    assert p.returncode == 2 and g.DENY_MSG in p.stderr        # scan path: ordinary deny
+    assert g._SIZE_MSG not in p.stderr
 
 
 def test_rescan_depth_cap_fails_closed():

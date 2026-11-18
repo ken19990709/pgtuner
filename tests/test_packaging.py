@@ -31,19 +31,49 @@ def test_setup_script_present_executable_and_idempotent_markers():
     assert f"v{pgtuner.__version__}" in text
 
 
-def test_packaged_assets_in_sync_with_repo_originals():
-    """v0.11.0 packaging fix: init distributes the packaged copies (wheel installs work);
-    the repo-root originals remain the live contract — this test is the drift guard."""
+def test_packaged_agents_is_concat_of_root_en_and_zh():
+    """init 装进用户项目的 AGENTS.md 是双语合并版(特性):资产必须精确等于
+    strip(AGENTS.md) + "\\n\\n---\\n\\n" + strip(AGENTS.zh-CN.md)(构造性校验,
+    非字节拷贝)。strip 规则:每个根文件恰有一行语言切换行(EN 是
+    "**English** | [简体中文](AGENTS.zh-CN.md)",ZH 是 "**简体中文** |
+    [English](AGENTS.md)"),连同前导空行一起剥掉——该行在 assets 目录与 init
+    落地的用户项目里都是死链(那里没有另一语言的文件可指),合并版不带它。
+    可直接粘贴的再生成命令(python 一行)见 CONTRIBUTING.md 的 "Packaged
+    assets must not drift" 条目,与本断言的公式逐字一致。"""
     root = Path(__file__).resolve().parents[1]
-    pairs = [
-        (root / "AGENTS.md", root / "pgtuner" / "assets" / "AGENTS.md"),
-        (root / ".zcode" / "skills" / "pg-experiment" / "SKILL.md",
-         root / "pgtuner" / "assets" / "SKILL.md"),
-    ]
-    for src, shipped in pairs:
-        assert shipped.is_file(), f"打包资产缺失: {shipped}"
-        assert src.read_text(encoding="utf-8") == shipped.read_text(encoding="utf-8"), (
-            f"打包资产与仓库原件漂移: {shipped}(重新拷贝保持一致)")
+    en = root / "AGENTS.md"
+    zh = root / "AGENTS.zh-CN.md"
+    shipped = root / "pgtuner" / "assets" / "AGENTS.md"
+    for f in (en, zh, shipped):
+        assert f.is_file(), f"文件缺失: {f}"
+
+    def _strip_switch(text: str, switch_line: str) -> str:
+        # exactly one such line per root file, sandwiched between blank lines;
+        # removing "\n\n<line>\n" -> "\n" keeps the title/quote spacing intact
+        return text.replace("\n\n" + switch_line + "\n", "\n")
+
+    expected = (
+        _strip_switch(en.read_text(encoding="utf-8"),
+                      "**English** | [简体中文](AGENTS.zh-CN.md)")
+        + "\n\n---\n\n"
+        + _strip_switch(zh.read_text(encoding="utf-8"),
+                        "**简体中文** | [English](AGENTS.md)"))
+    actual = shipped.read_text(encoding="utf-8")
+    assert actual == expected, (
+        f"打包 AGENTS.md 与拼接公式漂移: {shipped}"
+        "(应为 剥离语言切换行后的 AGENTS.md + 空行---空行 + 剥离后的"
+        " AGENTS.zh-CN.md,重跑 CONTRIBUTING.md 里的再生成命令)")
+
+
+def test_packaged_skill_in_sync_with_repo_original():
+    """v0.11.0 packaging fix: init distributes the packaged copy (wheel installs work);
+    the repo-root original remains the live contract — this test is the drift guard."""
+    root = Path(__file__).resolve().parents[1]
+    src = root / ".zcode" / "skills" / "pg-experiment" / "SKILL.md"
+    shipped = root / "pgtuner" / "assets" / "SKILL.md"
+    assert shipped.is_file(), f"打包资产缺失: {shipped}"
+    assert src.read_text(encoding="utf-8") == shipped.read_text(encoding="utf-8"), (
+        f"打包资产与仓库原件漂移: {shipped}(重新拷贝保持一致)")
 
 
 def test_shipped_data_lives_inside_the_package():

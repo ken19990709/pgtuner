@@ -43,7 +43,7 @@ HELP = {
     ("diagnose", "--analyze"): "EXPLAIN ANALYZE (executes the statements; plan-level actual values, TPS conclusions still require bench/rebench)",
     ("diagnose", "--label"): "Ledger label (results references may use diagnose:<label>)",
     ("diagnose", "--hypothesis"): "One-sentence hypothesis (recorded in the ledger; the conclusion must match it)",
-    ("diagnose", "--verify"): "Verification loop: measured baseline → greedy real index creation (at most --verify-max-indexes of them) → re-measure → A/B diff with automatic conclusion write-back; one command yields all the ledger evidence (really creates indexes — use only on a clone; requires --instance)",
+    ("diagnose", "--verify"): "Verification loop: measured baseline → greedy real index creation (at most --verify-max-indexes of them) → re-measure → A/B diff with automatic conclusion write-back; one command yields all the ledger evidence (really creates indexes — use only on a clone; requires --instance or a configured default instance)",
     ("diagnose", "--verify-runs"): "Measurement passes per query for --verify (median taken)",
     ("diagnose", "--verify-max-indexes"): "Maximum number of indexes the --verify greedy pass lands (the index trade-off for multi-query workloads, done in one command)",
     ("diagnose", "--weights"): "Comma-separated query weights (calls from pg_stat_statements recommended; aligned with query order, all 1 by default)",

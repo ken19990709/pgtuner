@@ -1,15 +1,19 @@
 # sdist completeness: tests must run from an unpacked sdist (conftest pins the
 # hermetic project root; fixtures/ are --with-db assets), and the READMEs'
-# cross-file links must resolve for offline readers. .zcode ships too: the
-# packaging drift guard compares the repo skill original against the packaged
-# copy, and config.json is a README-declared distribution artifact.
+# cross-file links must resolve for offline readers. Of the .zcode/ tree only
+# the two tracked artifacts ship, for their own consumers: the drift guard
+# needs the skill original .zcode/skills/pg-experiment/SKILL.md to compare
+# the packaged copy against, and the README links .zcode/config.json as the
+# hook wiring reference. examples/q.sql is the README 60-second-start demo
+# query.
 include LICENSE
-include README.md README.zh-CN.md CHANGELOG.md CONTRIBUTING.md AGENTS.md CLAUDE.md
+include README.md README.zh-CN.md CHANGELOG.md CONTRIBUTING.md AGENTS.md AGENTS.zh-CN.md CLAUDE.md
 include conftest.py
+include examples/q.sql
 recursive-include tests *.py *.sql
 recursive-include scripts *.sh *.py
 recursive-include pgtuner/assets *.md *.sql
 recursive-include pgtuner/data *.json
-recursive-include .zcode *.md
+include .zcode/skills/pg-experiment/SKILL.md
 include .zcode/config.json
 prune .zcode/plans

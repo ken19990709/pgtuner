@@ -1,0 +1,12 @@
+-- examples/q.sql — the query used by the README "60-second start" demo.
+--
+-- Shape: top-20 rows of one account ordered by mtime over pgbench_history —
+-- a predicate+sort that starts as a Seq Scan on the bootstrapped template
+-- and gives `pgtuner diagnose --verify` a crisp candidate ranking (the
+-- winning candidate covers both the aid predicate and the mtime ordering).
+--
+-- Where the table comes from: `pgtuner lab bootstrap` runs `pgbench -i`
+-- and then the packaged template_setup.sql, which fills pgbench_history
+-- with a deterministic 1M rows spread over all aid values (newer pgbench
+-- -i versions leave it empty).
+SELECT delta, mtime FROM pgbench_history WHERE aid = 424242 ORDER BY mtime DESC LIMIT 20;

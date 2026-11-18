@@ -17,6 +17,19 @@ pgtuner.egg-info/
 .auto/
 autoresearch-dashboard.html
 
-# Editor/agent local config (kept out of the published repo)
-.zcode/
+# Editor/agent local config (kept out of the published repo) — except the two
+# tracked artifacts under .zcode/: config.json is linked from the README and
+# shipped in the sdist, and .zcode/skills/pg-experiment/SKILL.md is the live
+# original the packaging drift guard compares the packaged copy against
+# (.zcode/plans and anything else stay local-only). The chain is exact — only
+# those two files are re-included, so future junk under .zcode/ stays ignored
+# (git does not descend into an ignored directory: each parent dir must be
+# re-included before its children can be).
+.zcode/*
+!.zcode/config.json
+!.zcode/skills
+.zcode/skills/*
+!.zcode/skills/pg-experiment
+.zcode/skills/pg-experiment/*
+!.zcode/skills/pg-experiment/SKILL.md
 .claude/

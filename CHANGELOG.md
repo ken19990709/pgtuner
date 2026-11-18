@@ -4,6 +4,51 @@ All notable changes to pgtuner are documented here. The format is loosely based 
 [Keep a Changelog](https://keepachangelog.com/); versions follow the repo's own
 history. Dates are omitted — see `git log` for exact timing.
 
+## Unreleased
+
+### Fixed
+
+- CI portability, two roots: the PreToolUse guard hook now rejects command
+  strings over 1 MiB (8x the Linux `MAX_ARG_STRLEN` per-argument cap)
+  fail-closed before any scanning, and the deeply-nested-payload timing test
+  asserts hardware-normalized ratios against same-size flat baselines plus a
+  pinned constant-time test for the size cap — the retired absolute
+  wall-clock budgets measured 1.9 s locally but 2.8–7.3 s on GitHub 2-core
+  runners, reddening the whole matrix.
+- `.zcode/config.json` and `.zcode/skills/pg-experiment/SKILL.md` are
+  trackable again (`.gitignore` re-include rules): fresh clones missed them,
+  so the packaging drift guard raised FileNotFoundError in CI and the README
+  link to `config.json` 404'd on GitHub.
+- `diagnose --verify` help now states the real requirement — `--instance` or
+  a configured default instance (the README paste flow relies on the latter);
+  the English help table says the same.
+- Both READMEs link `.zcode/config.json` again as the guard-hook wiring
+  reference (the README rework had dropped the only pointer to a file the
+  repo and sdist still ship).
+
+### Changed
+
+- Packaging identity aligned with the GitHub account: `pyproject.toml`
+  author and the LICENSE copyright line now say `ken19990709` (the URLs
+  already did).
+- `.gitignore`/`MANIFEST.in` narrowed to exactly the two tracked `.zcode/`
+  artifacts (per-directory re-include chain; plain `include` instead of
+  `recursive-include .zcode *.md`), so future files under `.zcode/` can no
+  longer leak into `git status` or the sdist.
+- README (en/zh-CN) reworked toward conversion: slimmer first-screen demo,
+  the 60-second start now uses `examples/q.sql` (new) with its
+  bare-metal fallback moved directly under the main block, PostgreSQL
+  preconditions noted, and the test count refreshed.
+- AGENTS.md split into English (`AGENTS.md`) and Chinese
+  (`AGENTS.zh-CN.md`) repo-root files; the init-distributed asset is their
+  bilingual merged edition with each file's single language-switch line
+  stripped (dead link inside packages and user projects);
+  `MANIFEST.in` ships `AGENTS.zh-CN.md` and `examples/q.sql` so an
+  unpacked sdist passes the packaging tests; regeneration command in
+  CONTRIBUTING.md.
+- Repository URLs corrected to the real GitHub repository
+  (`ken19990709/pgtuner`).
+
 ## 0.11.0 — open-source readiness drop
 
 The version published as the first public release. Everything below is relative to

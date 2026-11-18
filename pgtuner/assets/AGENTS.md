@@ -4,7 +4,7 @@
 > exactly one source of truth: `pgtuner --help` and `pgtuner <cmd> --help`** — it ships with
 > the binary and never goes stale (`PGTUNER_LANG=en` switches help to English). This file
 > sets rules only and does not restate usage (the human-readable README may lag behind
-> help). 中文版在下方分隔线之后。
+> help).
 
 ## The five iron rules
 
@@ -39,6 +39,7 @@ on template dbs or other people's dbs.
 On a new machine or session, run `pgtuner doctor` first (start working when the ❌ count is
 zero); to save round trips, chain related commands with `&&` in a single Bash call and
 capture outputs with `$()`.
+
 
 ---
 

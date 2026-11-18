@@ -2208,7 +2208,7 @@ def advise_cmd(query_args: tuple[str, ...], queries_file: str | None, from_ss: i
 @click.option("--hypothesis", default=None, help="一句话假设(落账本,结论须对得上)")
 @click.option("--verify", is_flag=True,
               help="验证闭环:基线实测→贪心真实建索引(至多 --verify-max-indexes 条)→复测→A/B diff"
-                   "并自动回填结论,一次命令出全部账本证据(会真实建索引——只在克隆库上用;需 --instance)")
+                   "并自动回填结论,一次命令出全部账本证据(会真实建索引——只在克隆库上用;需 --instance 或已设默认实例)")
 @click.option("--verify-runs", type=click.IntRange(min=1), default=5, show_default=True,
               help="--verify 每查询测量次数(取中位)")
 @click.option("--verify-max-indexes", type=click.IntRange(min=1, max=6), default=3,

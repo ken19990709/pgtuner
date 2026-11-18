@@ -278,6 +278,18 @@ applied to decoding: `printf %s $'a\<LF>b'` emits a \ LF b) — the pair is
 no longer decoded away, so `$'ps\<LF>ql'` is NOT the command psql (bash:
 command not found) and is allowed instead of over-denied.
 
+Input-size fast-reject (CI-portability round): a command string longer
+than _MAX_COMMAND_CHARS (1 Mi characters — 8x the Linux MAX_ARG_STRLEN
+of 128 KiB per single argument string, a length no real command line can
+reach) is denied fail-closed BEFORE any scanning, escape-tail regex
+included — the multi-MB nested-payload fixtures are therefore O(1)
+denies. Rationale: their linear scan cost measured 1.9 s on a fast box
+but 2.8–7.3 s on GitHub 2-core runners, so any absolute wall-clock
+budget pinned "quickly denied" hardware-sensitively; the size gate makes
+the pathological samples constant-time and the timing tests now assert
+hardware-normalized ratios against same-size flat baselines (see
+tests/test_guard_hook.py).
+
 Declared boundaries (known, honest out-of-scope — allowed by design):
 variable indirection (`P=psql; $P -c 1`) is statically unresolvable;
 remote segments (`| ssh host psql ...` for non-local hosts) execute on
@@ -355,6 +367,16 @@ _C_PAYLOAD = _SHELLS | _EVAL | {"script", "su"}
 # Rescan recursion cap for nested -c/eval payloads: deeper nesting is
 # denied fail-closed (a hook timeout would be fail-open — banned).
 _MAX_DEPTH = 20
+# Input-size fast-reject (CI-portability round): a command string longer
+# than this is denied fail-closed BEFORE any per-character scanning.
+# Linux caps one argument string at MAX_ARG_STRLEN = 128 KiB (32 pages),
+# so a hook-visible command 8x longer cannot be a real shell command line
+# — the multi-MB nested-payload fixtures used to cost linear scan time
+# (1.9 s on a fast box, 2.8–7.3 s measured on GitHub 2-core runners,
+# reddening the whole CI matrix against a hard absolute budget) and are
+# now an O(1) deny. Measured in characters: len() is O(1) and any string
+# past this many characters is past 1 MiB of bytes too.
+_MAX_COMMAND_CHARS = 1 << 20
 # Shell compound-command keywords (R4-C-F2/D-F4): they occupy a command
 # position WITHOUT being a command — skip the word and keep scanning the
 # next command-position word (previously the first token being a keyword
@@ -510,6 +532,13 @@ _DEEP_MSG = (
     "(防深嵌套 DoS,fail-closed:宁可拒绝也不超时放行)。\n"
     "请展平命令(去掉多层 bash -c/eval 包装)再试;计时请走 pgtuner 通道"
     "(见 `pgtuner --help`);确需放行:命令行尾加 `# allow-raw-psql`。"
+)
+_SIZE_MSG = (
+    "命令字符串超过 1 MiB(1,048,576 字符),已达 Linux 单参数上限 MAX_ARG_STRLEN"
+    "(128 KiB)的 8 倍——真实命令行不可能这么长,按病态输入直接拒绝"
+    "(fail-closed:不扫描、不超时)。\n"
+    "请检查是否把超大文本(如整个文件)误粘进了命令;计时请走 pgtuner 通道"
+    "(见 `pgtuner --help`)。"
 )
 
 
@@ -1558,6 +1587,12 @@ def _segment_violates(segment: str, depth: int = 0, prev_sep: str | None = None,
 
 
 def _deny_reason(command: str):
+    # Size gate FIRST, before any per-character work (the escape-tail regex
+    # included — it scans): an oversized input is rejected in O(1) no matter
+    # what it contains, and the # allow-raw-psql hatch does not apply past
+    # the cap (a >1 MiB "command" cannot be executed by the shell anyway).
+    if len(command) > _MAX_COMMAND_CHARS:
+        return _SIZE_MSG
     if _ESCAPE_TAIL.search(command):
         return None
     try:
