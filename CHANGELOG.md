@@ -20,6 +20,11 @@ history. Dates are omitted — see `git log` for exact timing.
   ~2.0 on 3.12 — while a genuinely superlinear blow-up measures in the
   tens-to-hundreds), and the matrix runs on `ubuntu-24.04` because the
   Ubuntu 26.04 runner image no longer provisions CPython 3.9.
+- Test-suite compatibility with the py3.9 leg of CI (click 8.1 — 8.2
+  dropped py3.9 — merges CliRunner streams by default): a `conftest.cli_runner()`
+  helper constructs the runner with separate stdout/stderr on every supported
+  click, and the three stream-sensitive tests (pure-stdout JSON ×2, stderr
+  warning ×1) go through it.
 - `.zcode/config.json` and `.zcode/skills/pg-experiment/SKILL.md` are
   trackable again (`.gitignore` re-include rules): fresh clones missed them,
   so the packaging drift guard raised FileNotFoundError in CI and the README

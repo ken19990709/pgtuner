@@ -7,3 +7,19 @@ import os
 from pathlib import Path
 
 os.environ.setdefault("PGTUNER_PROJECT_ROOT", str(Path(__file__).resolve().parent))
+
+
+def cli_runner():
+    """CliRunner with SEPARATE stdout/stderr on every click we support.
+    py3.9 resolves click 8.1 (8.2 dropped py3.9): streams merge by default
+    there, so .stderr raises and stdout is not machine-readable — those
+    calls need mix_stderr=False. click >= 8.2 always separates and rejects
+    the kwarg (TypeError). Tests asserting pure-stdout JSON or reading
+    .stderr must construct their runner through this helper (first seen on
+    the CI 3.9 leg, run 44206869866 — 3.9 had never executed the suite
+    before, its setup-python step used to fail earlier)."""
+    from click.testing import CliRunner
+    try:
+        return CliRunner(mix_stderr=False)   # click < 8.2
+    except TypeError:
+        return CliRunner()                   # click >= 8.2: always separate

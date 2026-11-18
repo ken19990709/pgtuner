@@ -278,7 +278,8 @@ def test_rebench_format_json_setup_pure_stdout(tmp_path, monkeypatch):
     argv = ["pgtuner", "rebench", "--instance", "t9", "--queries-file", str(qf),
             "--db=d1", "--setup", "ANALYZE events", "--format", "json", "--yes"]   # --yes: setup onto a non-pool db needs consent (R2-D gate)
     monkeypatch.setattr(sys, "argv", argv)
-    r = CliRunner().invoke(cli.cli, argv[1:])
+    from conftest import cli_runner
+    r = cli_runner().invoke(cli.cli, argv[1:])
     assert r.exit_code == 0, r.output
     doc = json.loads(r.stdout)                                # stdout is pure JSON, directly parseable
     assert doc["id"].startswith("exp-") and doc["kind"] == "rebench"
@@ -324,7 +325,8 @@ def test_planbench_format_json_pure_stdout(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "PLANS_DIR", tmp_path / "plans")
     qf = tmp_path / "q.sql"
     qf.write_text("SELECT 1;\n", encoding="utf-8")
-    r = CliRunner().invoke(cli.cli, ["planbench", str(qf), "--format", "json"])
+    from conftest import cli_runner
+    r = cli_runner().invoke(cli.cli, ["planbench", str(qf), "--format", "json"])
     assert r.exit_code == 0, r.output
     doc = json.loads(r.stdout)
     assert doc["id"].startswith("exp-") and doc["kind"] == "planbench"

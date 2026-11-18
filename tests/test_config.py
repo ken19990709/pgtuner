@@ -76,7 +76,8 @@ def test_config_show_corrupt_json_warns_on_stderr(tmp_path, monkeypatch, capsys)
     f.write_text("{broken", encoding="utf-8")
     monkeypatch.setattr(config_mod, "CONFIG_FILE", f)
     monkeypatch.delenv("PGTUNER_INSTANCE", raising=False)
-    res = CliRunner().invoke(cli.cli, ["config", "show"])
+    from conftest import cli_runner
+    res = cli_runner().invoke(cli.cli, ["config", "show"])
     assert res.exit_code == 0
     assert "未设置" in res.output
     err = res.stderr
