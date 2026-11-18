@@ -7,7 +7,11 @@ on:
 
 jobs:
   tests:
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, not ubuntu-latest: the 26.04 runner image no longer
+    # provisions CPython 3.9 via setup-python (EOL), and the 3.9 leg of the
+    # matrix is part of the public "Python 3.9+" promise. Revisit if 3.9
+    # support is ever dropped.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:

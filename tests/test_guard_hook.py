@@ -271,7 +271,7 @@ def test_deeply_nested_payload_denied_quickly():
     CI runners, reddening the whole matrix: absolute wall-clock budgets
     are UNSAFE on slow hardware (the lesson of that round, stated
     plainly). Replaced by hardware-normalized checks: every fixture still
-    denies; each multi-KB fixture must stay under 3x the time of a
+    denies; each multi-KB fixture must stay under 10x the time of a
     SAME-SIZE flat baseline (see _flat_payload_baseline — the
     hardware-independent form of "no superlinear blow-up"); one loose
     absolute total (<15 s) survives purely as a pathological-hang
@@ -284,11 +284,19 @@ def test_deeply_nested_payload_denied_quickly():
     load reddened 1 of 6 real pytest runs — failure shape: the flat
     baseline's one sample lands in a quiet window while the nested side's
     one sample eats contention, i.e. mismatched conditions, not a real
-    blow-up). Both sides therefore run 3x and take the min (k stays 3):
-    min filters contention spikes, letting each side catch its own quiet
+    blow-up). Both sides therefore run 3x and take the min (k still 3 at
+    that time): min filters contention spikes, letting each side catch its own quiet
     window so the ratio compares quiet-vs-quiet; taking min on the nested
     side is also safe — a genuinely superlinear scan stays slow in every
-    sample, so min cannot manufacture a false pass."""
+    sample, so min cannot manufacture a false pass.
+    Post-push CI then showed the threshold itself, not the sampling, was
+    the remaining flaw: the INTRINSIC nested/flat ratio is interpreter-
+    version-dependent (run 44205795900: 3.10 measured 3.23, 3.11 3.07,
+    both with min-of-3 on every side, while 3.12 passes at ~2.0) — so k=3
+    sat inside honest cross-version drift. k=10 now: measured drift stays
+    ≤3.3 on any version, while the genuinely superlinear shapes this test
+    exists for measure in the tens-to-hundreds — both sides keep ≥3x
+    headroom."""
     t0 = time.monotonic()
     scanned = (                                          # under the 1 MiB size cap: really scanned
         (_nested_alt_quotes(21), "alternating-quote nesting beyond the 20-level cap, 352 KB"),
@@ -306,7 +314,7 @@ def test_deeply_nested_payload_denied_quickly():
     for cmd, note in scanned + size_capped:
         t_nested = _run_timed_min(cmd)                   # min-of-3 each side (B2): ratio vs
         t_flat = _run_timed_min(_flat_payload_baseline(len(cmd)))   # same-size flat baseline
-        assert t_nested < 3 * t_flat, note
+        assert t_nested < 10 * t_flat, note
     assert time.monotonic() - t0 < 15.0                  # pathological-hang backstop ONLY
 
 

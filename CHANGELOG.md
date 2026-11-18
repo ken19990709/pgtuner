@@ -14,7 +14,12 @@ history. Dates are omitted — see `git log` for exact timing.
   asserts hardware-normalized ratios against same-size flat baselines plus a
   pinned constant-time test for the size cap — the retired absolute
   wall-clock budgets measured 1.9 s locally but 2.8–7.3 s on GitHub 2-core
-  runners, reddening the whole matrix.
+  runners, reddening the whole matrix. Follow-up calibration from the first
+  real post-push run: the ratio threshold is 10x (the nested/flat cost
+  ratio is interpreter-version-dependent — 3.07–3.23 on CI 3.10/3.11 vs
+  ~2.0 on 3.12 — while a genuinely superlinear blow-up measures in the
+  tens-to-hundreds), and the matrix runs on `ubuntu-24.04` because the
+  Ubuntu 26.04 runner image no longer provisions CPython 3.9.
 - `.zcode/config.json` and `.zcode/skills/pg-experiment/SKILL.md` are
   trackable again (`.gitignore` re-include rules): fresh clones missed them,
   so the packaging drift guard raised FileNotFoundError in CI and the README
